@@ -1,0 +1,21 @@
+{
+  "name": "nda-dispatch",
+  "private": true,
+  "version": "0.0.0",
+  "workspaces": [
+    "infra",
+    "packages/*",
+    "services/*",
+    "web"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "synth": "npm --prefix infra run synth",
+    "diff:dev": "npm --prefix infra run diff:dev",
+    "deploy:dev": "npm --prefix infra run deploy:dev",
+    "deploy:prod": "npm --prefix infra run deploy:prod"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
