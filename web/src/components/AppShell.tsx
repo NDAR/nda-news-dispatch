@@ -132,6 +132,27 @@ export function AppShell() {
           })}
         </nav>
 
+        {!collapsed && (
+          <div
+            style={{
+              fontSize: 11,
+              color: 'var(--ink-mute)',
+              padding: '8px 14px 6px',
+              textAlign: 'center',
+            }}
+          >
+            Made by{' '}
+            <a
+              href="https://scienthouse.io"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: 'inherit', textDecoration: 'underline' }}
+            >
+              ScientHouse
+            </a>
+          </div>
+        )}
+
         <div className="sidebar-footer" style={collapsed ? { justifyContent: 'center', padding: 8 } : undefined}>
           <div className="avatar" style={{ width: 28, height: 28, fontSize: 13 }}>
             {initials}

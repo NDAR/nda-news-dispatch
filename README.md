@@ -1,10 +1,10 @@
-# ScientHouse Dispatch
+# Ants Dispatch
 
 A serverless newsletter sender for small admin teams. Compose HTML or
 WYSIWYG, segment subscribers by tag, send (or schedule) campaigns through
 SES, track delivery / opens / clicks / bounces, and self-serve unsubscribes.
 
-The default brand prefix is **ScientHouse** (configurable per build via
+The default brand prefix is **Ants** (configurable per build via
 `VITE_APP_BRAND` — see [Brand](#brand)).
 
 ## Tech stack
@@ -336,7 +336,7 @@ Set:
 - `VITE_COGNITO_DOMAIN=<HostedUiDomain>`
 - `VITE_COGNITO_CLIENT_ID=<UserPoolClientId>`
 - `VITE_REDIRECT_URI=https://dispatch.your-domain.com/auth/callback`
-- `VITE_APP_BRAND=ScientHouse` *(optional; default is "ScientHouse")*
+- `VITE_APP_BRAND=Ants` *(optional; default is "Ants")*
 
 Then build + push:
 
@@ -419,7 +419,7 @@ The prefix is configurable; "Dispatch" is fixed.
 VITE_APP_BRAND=NDA           # → "NDA Dispatch", collapsed mark "N•"
 ```
 
-Defaults to `ScientHouse` if unset. Rebuild + redeploy the SPA to apply.
+Defaults to `Ants` if unset. Rebuild + redeploy the SPA to apply.
 
 ### Domain
 
@@ -444,30 +444,13 @@ identity, and Cognito's allowed callback URL.
 
 ## License
 
-Copyright © 2026 ScientHouse contributors.
+Copyright © 2026 ScientHouse LLC
 
-This program is free software: you can redistribute it and/or modify it under
-the terms of the **GNU Affero General Public License v3.0** as published by
-the Free Software Foundation. See [`LICENSE`](./LICENSE) for the full text.
-
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE.
-
-### What AGPL-3.0 means in practice
-
-- You can run, study, modify, and redistribute the source freely.
-- If you **modify the code and let other people use the modified version over
-  a network** (e.g. host it as a SaaS), you must offer those users access to
-  the corresponding source — including your modifications — under the same
-  AGPL-3.0 terms.
-- Internal use within an organization (no third-party network access) does
-  not trigger the source-disclosure requirement.
-- Combining this code with permissively-licensed code (MIT/Apache-2.0) is
-  fine; the combined work is distributed under AGPL-3.0.
-
-If those terms don't fit your use case, contact the maintainers about a
-commercial license.
+Released under the **MIT License** — see [`LICENSE`](./LICENSE) for the full
+text. You may use, copy, modify, merge, publish, distribute, sublicense, and
+sell copies of the software, including in proprietary or SaaS products,
+provided the copyright notice and the license text are kept in any
+substantial portion of the software you distribute.
 
 ### Third-party notices
 

@@ -56,7 +56,7 @@ export class DeliveryStack extends Stack {
     const repoRoot = path.resolve(__dirname, '../..');
     const sendingDomain = config.sendingDomain;
     const publicBaseUrl = `https://${config.publicHost}`;
-    this.fromAddress = `NDA Dispatch <dispatch@${sendingDomain}>`;
+    this.fromAddress = `Ants Dispatch <dispatch@${sendingDomain}>`;
 
     this.configSet = new CfnConfigurationSet(this, 'ConfigSet', {
       name: `nda-dispatch-${config.envName}`,
@@ -77,7 +77,7 @@ export class DeliveryStack extends Stack {
 
     this.eventsTopic = new Topic(this, 'SesEventsTopic', {
       topicName: `nda-dispatch-${config.envName}-ses-events`,
-      displayName: 'NDA Dispatch — SES events',
+      displayName: 'Ants Dispatch — SES events',
     });
 
     new CfnConfigurationSetEventDestination(this, 'SesEventsDest', {

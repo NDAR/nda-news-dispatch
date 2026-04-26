@@ -11,7 +11,7 @@ function must(name: string, value: string | undefined): string {
 // The brand prefix shown before "Dispatch" everywhere in the UI (sidebar,
 // browser title, favicon initial). "Dispatch" is fixed; only the prefix is
 // configurable via build-time `VITE_APP_BRAND` (.env.production / shell var).
-const APP_BRAND = (import.meta.env.VITE_APP_BRAND ?? 'ScientHouse').trim() || 'ScientHouse';
+const APP_BRAND = (import.meta.env.VITE_APP_BRAND ?? 'Ants').trim() || 'Ants';
 
 export const config = {
   apiBase: import.meta.env.VITE_API_BASE ?? '',
