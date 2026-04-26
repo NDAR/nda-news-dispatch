@@ -12,10 +12,12 @@ import {
 } from '../api/endpoints';
 import { Metric } from '../components/metrics/Metric';
 import { Sparkline } from '../components/metrics/Sparkline';
+import { LineChart } from '../components/metrics/LineChart';
 import { OpenBar } from '../components/metrics/OpenBar';
 import { StatusPill } from '../components/metrics/StatusPill';
 import { TypePill } from '../components/types/TypePill';
-import { formatNumber, formatPct } from '../lib/format';
+import { formatDate, formatNumber, formatPct } from '../lib/format';
+import { useEffect } from 'react';
 
 export const Route = createFileRoute('/_app/history')({
   component: HistoryPage,
@@ -63,6 +65,7 @@ function HistoryList() {
   // 'all' = no filter; specific id = restrict to that type. Includes archived
   // types so historical campaigns under an archived type still surface here.
   const [typeFilter, setTypeFilter] = useState<string>('all');
+  const [trendMetric, setTrendMetric] = useState<MetricKey | null>(null);
 
   const { data: types = [] } = useQuery({
     queryKey: ['types', true],
@@ -222,21 +225,34 @@ function HistoryList() {
           label={`Avg. open rate${typeFilter !== 'all' ? ` · ${typeById.get(typeFilter)?.name ?? ''}` : ''}`}
           value={formatPct(aggregates.totals.opened, aggregates.totals.delivered)}
           spark={<Sparkline values={aggregates.openSpark} />}
+          onClick={() => setTrendMetric('open')}
         />
         <Metric
           label="Avg. click-through"
           value={formatPct(aggregates.totals.clicked, aggregates.totals.delivered)}
           spark={<Sparkline values={aggregates.clickSpark} />}
+          onClick={() => setTrendMetric('click')}
         />
         <Metric
           label="Unsubscribe rate"
           value={formatPct(aggregates.totals.unsubscribed, aggregates.totals.delivered)}
+          onClick={() => setTrendMetric('unsub')}
         />
         <Metric
           label="Bounce rate"
           value={formatPct(aggregates.totals.bounced, aggregates.totals.delivered)}
+          onClick={() => setTrendMetric('bounce')}
         />
       </div>
+      {trendMetric && (
+        <MetricTrendModal
+          metric={trendMetric}
+          campaigns={byStatus.get('queued') ?? []}
+          typeFilter={typeFilter}
+          typeById={typeById}
+          onClose={() => setTrendMetric(null)}
+        />
+      )}
 
       <div className="card">
         <div className="card-header">
@@ -539,4 +555,166 @@ function formatRelative(ms: number): string {
   if (hr < 24) return `${hr} hour${hr === 1 ? '' : 's'}`;
   const day = Math.round(hr / 24);
   return `${day} day${day === 1 ? '' : 's'}`;
+}
+
+// ── Metric trend modal ─────────────────────────────────────────────────────
+
+type MetricKey = 'open' | 'click' | 'unsub' | 'bounce';
+
+const METRIC_META: Record<MetricKey, { title: string; numerator: keyof NonNullable<Campaign['stats']> }> = {
+  open: { title: 'Open rate', numerator: 'opened' },
+  click: { title: 'Click-through rate', numerator: 'clicked' },
+  unsub: { title: 'Unsubscribe rate', numerator: 'unsubscribed' },
+  bounce: { title: 'Bounce rate', numerator: 'bounced' },
+};
+
+function MetricTrendModal({
+  metric,
+  campaigns,
+  typeFilter,
+  typeById,
+  onClose,
+}: {
+  metric: MetricKey;
+  campaigns: Campaign[];
+  typeFilter: string;
+  typeById: Map<string, NewsletterType>;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const { title, numerator } = METRIC_META[metric];
+  const filtered = useMemo(() => {
+    const sent = typeFilter === 'all' ? campaigns : campaigns.filter((c) => c.typeId === typeFilter);
+    // Oldest → newest. Skip campaigns with no delivered stats since the rate
+    // would be undefined.
+    return sent
+      .filter((c) => (c.stats?.delivered ?? 0) > 0 && !!c.sentAt)
+      .sort((a, b) => new Date(a.sentAt!).getTime() - new Date(b.sentAt!).getTime());
+  }, [campaigns, typeFilter]);
+
+  const series = useMemo(
+    () =>
+      filtered.map((c, i) => ({
+        h: i + 1,
+        cumulative: rate(c.stats?.[numerator], c.stats?.delivered) * 100,
+      })),
+    [filtered, numerator],
+  );
+
+  const summary = useMemo(() => {
+    if (series.length === 0) return null;
+    const values = series.map((s) => s.cumulative);
+    const avg = values.reduce((a, b) => a + b, 0) / values.length;
+    const max = Math.max(...values);
+    const min = Math.min(...values);
+    const peakIdx = values.indexOf(max);
+    const lowIdx = values.indexOf(min);
+    return { avg, max, min, peak: filtered[peakIdx], low: filtered[lowIdx] };
+  }, [series, filtered]);
+
+  const typeLabel = typeFilter !== 'all' ? typeById.get(typeFilter)?.name : null;
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal modal-lg"
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: '92vw', maxWidth: 920, display: 'flex', flexDirection: 'column' }}
+      >
+        <div className="modal-header">
+          <div className="eyebrow">Trend over time</div>
+          <h2 className="serif" style={{ fontSize: 18, marginTop: 4 }}>
+            {title}
+            {typeLabel ? <span className="muted" style={{ fontSize: 14 }}> · {typeLabel}</span> : null}
+          </h2>
+          <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+            One point per sent campaign, oldest to newest. Y axis is the rate (%).
+          </p>
+        </div>
+        <div className="modal-body" style={{ padding: '12px 16px 16px' }}>
+          {series.length < 2 ? (
+            <p className="muted" style={{ padding: 24, textAlign: 'center' }}>
+              Not enough sent campaigns yet to draw a trend.
+            </p>
+          ) : (
+            <>
+              <div style={{ height: 280, marginBottom: 40 }}>
+                <LineChart data={series} height={280} xUnit="" />
+              </div>
+              <div
+                className="row items-start"
+                style={{
+                  paddingTop: 16,
+                  borderTop: '1px solid var(--rule-soft)',
+                  justifyContent: 'space-between',
+                  gap: 24,
+                  flexWrap: 'wrap',
+                }}
+              >
+                <div style={{ flex: '1 1 0', minWidth: 160 }}>
+                  <div className="label">Average</div>
+                  <div className="serif" style={{ fontSize: 20 }}>
+                    {summary!.avg.toFixed(1)}%
+                  </div>
+                  <div className="muted" style={{ fontSize: 12, marginTop: 2 }}>
+                    across {series.length} campaign{series.length === 1 ? '' : 's'}
+                  </div>
+                </div>
+                <div style={{ flex: '1 1 0', minWidth: 200 }}>
+                  <div className="label">Peak</div>
+                  <div className="serif" style={{ fontSize: 20 }}>
+                    {summary!.max.toFixed(1)}%
+                  </div>
+                  <div
+                    className="muted"
+                    style={{
+                      fontSize: 12,
+                      marginTop: 2,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                    title={summary!.peak?.subject || summary!.peak?.name}
+                  >
+                    {summary!.peak?.subject || summary!.peak?.name}
+                    {summary!.peak?.sentAt ? ` · ${formatDate(summary!.peak.sentAt)}` : ''}
+                  </div>
+                </div>
+                <div style={{ flex: '1 1 0', minWidth: 200 }}>
+                  <div className="label">Low</div>
+                  <div className="serif" style={{ fontSize: 20 }}>
+                    {summary!.min.toFixed(1)}%
+                  </div>
+                  <div
+                    className="muted"
+                    style={{
+                      fontSize: 12,
+                      marginTop: 2,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                    title={summary!.low?.subject || summary!.low?.name}
+                  >
+                    {summary!.low?.subject || summary!.low?.name}
+                    {summary!.low?.sentAt ? ` · ${formatDate(summary!.low.sentAt)}` : ''}
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+        <div className="modal-footer" style={{ justifyContent: 'flex-end' }}>
+          <button className="btn btn-sm" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
 }

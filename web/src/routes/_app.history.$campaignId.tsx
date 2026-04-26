@@ -9,7 +9,6 @@ import {
   type CampaignRecipient,
 } from '../api/endpoints';
 import { Metric } from '../components/metrics/Metric';
-import { Funnel } from '../components/metrics/Funnel';
 import { LineChart } from '../components/metrics/LineChart';
 import { StatusPill } from '../components/metrics/StatusPill';
 import { TypePill } from '../components/types/TypePill';
@@ -162,30 +161,12 @@ function CampaignDetailPage() {
         onRangeChange={setRange}
       />
 
-      <div className="grid grid-2">
-        <div className="card">
-          <div className="card-header">
-            <h3 className="serif">Delivery funnel</h3>
-          </div>
-          <div className="card-body">
-            <Funnel
-              steps={[
-                { label: 'Sent', value: recipients },
-                { label: 'Delivered', value: delivered },
-                { label: 'Opened', value: opened },
-                { label: 'Clicked', value: clicked },
-              ]}
-            />
-            {bounced > 0 && (
-              <div className="muted mt-md" style={{ fontSize: 12 }}>
-                {formatNumber(bounced)} bounced ({formatPct(bounced, recipients)})
-              </div>
-            )}
-          </div>
+      <TopLinks rcpts={recipientsQ.data?.items ?? []} totalClicks={clicked} loading={recipientsQ.isLoading} />
+      {bounced > 0 && (
+        <div className="muted" style={{ fontSize: 12 }}>
+          {formatNumber(bounced)} bounced ({formatPct(bounced, recipients)})
         </div>
-
-        <TopLinks rcpts={recipientsQ.data?.items ?? []} totalClicks={clicked} loading={recipientsQ.isLoading} />
-      </div>
+      )}
 
       {contentOpen && (
         <ContentModal html={data.html} subject={data.subject} onClose={() => setContentOpen(false)} />
@@ -415,17 +396,22 @@ function TopLinks({
                     className="mono-sm"
                     style={{
                       color: 'var(--accent-deep)',
-                      maxWidth: 0,
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
+                      wordBreak: 'break-all',
                     }}
-                    title={l.url}
                   >
-                    {l.url}
+                    <a
+                      href={l.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ color: 'inherit', textDecoration: 'none' }}
+                    >
+                      {l.url}
+                    </a>
                   </td>
-                  <td className="text-right mono-sm">{formatNumber(l.count)}</td>
-                  <td className="text-right mono-sm muted">
+                  <td className="text-right mono-sm" style={{ whiteSpace: 'nowrap' }}>
+                    {formatNumber(l.count)}
+                  </td>
+                  <td className="text-right mono-sm muted" style={{ whiteSpace: 'nowrap' }}>
                     {denom ? `${Math.round((l.count / denom) * 100)}%` : '—'}
                   </td>
                 </tr>
