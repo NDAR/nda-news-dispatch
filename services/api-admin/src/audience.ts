@@ -2,10 +2,9 @@ import type { APIGatewayProxyHandler, APIGatewayProxyEvent, APIGatewayProxyResul
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
   DynamoDBDocumentClient,
-  QueryCommand,
   ScanCommand,
-  BatchGetCommand,
 } from '@aws-sdk/lib-dynamodb';
+import { materializeAudienceProfiles } from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -113,47 +112,11 @@ async function previewAudience(input: PreviewInput): Promise<PreviewResponse> {
   const tags = validTags(input.tags);
   const excludeTags = validTags(input.excludeTags);
 
-  // We always need the total active count for the denominator. When there's
-  // no include filter we use the same set as the candidate base — saves a
-  // second table scan.
-  const [tagSets, excludeSets, allActive] = await Promise.all([
-    Promise.all(tags.map((t) => queryTag(t))),
-    Promise.all(excludeTags.map((t) => queryTag(t))),
-    listAllActiveContactEmails(),
+  const [matched, allActive] = await Promise.all([
+    materializeAudienceProfiles(ddb, TABLE, { tags, excludeTags, tagMode }),
+    materializeAudienceProfiles(ddb, TABLE, { tags: [], excludeTags: [], tagMode: 'all' }),
   ]);
-  const excluded = union(excludeSets);
-
-  let base: Set<string>;
-  if (tagSets.length === 0) {
-    base = allActive;
-  } else if (tagMode === 'all') {
-    base = intersect(tagSets);
-  } else {
-    base = union(tagSets);
-  }
-
-  const candidates = [...base].filter((e) => !excluded.has(e));
-  const total = allActive.size;
-
-  if (candidates.length === 0) {
-    return { count: 0, total, topTags: [], sample: [] };
-  }
-
-  // Pull the profile + suppression flags for each candidate so we can:
-  //   - filter to active + non-suppressed (canonical "would receive")
-  //   - compute the tag breakdown
-  //   - assemble the sample row
-  const profiles = await batchGetProfiles(candidates);
-  const suppressed = await checkSuppressions(candidates);
-
-  const matched: ProfileRow[] = [];
-  for (const e of candidates) {
-    const p = profiles.get(e);
-    if (!p) continue;
-    if (p.status !== 'active') continue;
-    if (suppressed.has(e)) continue;
-    matched.push(p);
-  }
+  const total = allActive.length;
 
   const tagCounts: Record<string, number> = {};
   for (const m of matched) for (const t of m.tags) tagCounts[t] = (tagCounts[t] ?? 0) + 1;
@@ -169,117 +132,6 @@ async function previewAudience(input: PreviewInput): Promise<PreviewResponse> {
   }));
 
   return { count: matched.length, total, topTags, sample };
-}
-
-// ── Lookups ────────────────────────────────────────────────────────────────
-
-interface ProfileRow {
-  email: string;
-  name: string;
-  org?: string;
-  tags: string[];
-  status: string;
-}
-
-async function queryTag(tag: string): Promise<Set<string>> {
-  const out = new Set<string>();
-  let cursor: Record<string, unknown> | undefined;
-  do {
-    const res = await ddb.send(
-      new QueryCommand({
-        TableName: TABLE,
-        IndexName: 'GSI1',
-        KeyConditionExpression: 'GSI1PK = :pk',
-        ExpressionAttributeValues: { ':pk': `TAG#${tag}` },
-        ProjectionExpression: 'email',
-        ExclusiveStartKey: cursor,
-      }),
-    );
-    for (const item of res.Items ?? []) out.add(String(item.email));
-    cursor = res.LastEvaluatedKey;
-  } while (cursor);
-  return out;
-}
-
-async function listAllActiveContactEmails(): Promise<Set<string>> {
-  const out = new Set<string>();
-  let cursor: Record<string, unknown> | undefined;
-  do {
-    const res = await ddb.send(
-      new ScanCommand({
-        TableName: TABLE,
-        FilterExpression: 'SK = :sk AND begins_with(PK, :p) AND #s = :active',
-        ExpressionAttributeNames: { '#s': 'status' },
-        ExpressionAttributeValues: { ':sk': 'PROFILE', ':p': 'CONTACT#', ':active': 'active' },
-        ProjectionExpression: 'email',
-        ExclusiveStartKey: cursor,
-      }),
-    );
-    for (const item of res.Items ?? []) out.add(String(item.email));
-    cursor = res.LastEvaluatedKey;
-  } while (cursor);
-  return out;
-}
-
-async function batchGetProfiles(emails: string[]): Promise<Map<string, ProfileRow>> {
-  const out = new Map<string, ProfileRow>();
-  for (let i = 0; i < emails.length; i += 100) {
-    const chunk = emails.slice(i, i + 100);
-    const res = await ddb.send(
-      new BatchGetCommand({
-        RequestItems: {
-          [TABLE]: {
-            Keys: chunk.map((e) => ({ PK: `CONTACT#${e}`, SK: 'PROFILE' })),
-          },
-        },
-      }),
-    );
-    for (const item of res.Responses?.[TABLE] ?? []) {
-      const email = String(item.email);
-      out.set(email, {
-        email,
-        name: String(item.name ?? ''),
-        org: (item.org as string | undefined) ?? undefined,
-        tags: (item.tags as string[] | undefined) ?? [],
-        status: String(item.status ?? 'active'),
-      });
-    }
-  }
-  return out;
-}
-
-async function checkSuppressions(emails: string[]): Promise<Set<string>> {
-  const out = new Set<string>();
-  await Promise.all(
-    emails.map(async (email) => {
-      const res = await ddb.send(
-        new QueryCommand({
-          TableName: TABLE,
-          KeyConditionExpression: 'PK = :pk',
-          ExpressionAttributeValues: { ':pk': `SUPP#${email}` },
-          Limit: 1,
-        }),
-      );
-      if ((res.Count ?? 0) > 0) out.add(email);
-    }),
-  );
-  return out;
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-function intersect(sets: Set<string>[]): Set<string> {
-  if (sets.length === 0) return new Set();
-  const [first, ...rest] = sets;
-  const out = new Set<string>();
-  for (const e of first) if (rest.every((s) => s.has(e))) out.add(e);
-  return out;
-}
-
-function union(sets: Set<string>[]): Set<string> {
-  const out = new Set<string>();
-  for (const s of sets) for (const e of s) out.add(e);
-  return out;
 }
 
 function validTags(v: string[] | undefined): string[] {

@@ -1,13 +1,12 @@
-import type { SQSHandler, SQSEvent, SQSRecord, S3Event, S3EventRecord } from 'aws-lambda';
+import type { SQSHandler, SQSRecord, S3Event, S3EventRecord } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
   DynamoDBDocumentClient,
-  BatchWriteCommand,
-  UpdateCommand,
   GetCommand,
-  QueryCommand,
+  UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { batchWriteAll, contactStatusIndexFields } from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -75,7 +74,10 @@ async function processS3Record(rec: S3EventRecord): Promise<void> {
         counts.invalid++;
         continue;
       }
-      if (await isSuppressed(email)) {
+      const existing = await ddb.send(
+        new GetCommand({ TableName: TABLE, Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' } }),
+      );
+      if (existingSuppressed(existing.Item as Record<string, unknown> | undefined)) {
         counts.suppressed++;
         continue;
       }
@@ -84,6 +86,7 @@ async function processS3Record(rec: S3EventRecord): Promise<void> {
         name: (row.name ?? '').trim() || email.split('@')[0],
         org: (row.org ?? row.organization ?? row.institution ?? '').trim() || undefined,
         assignTags,
+        existing: existing.Item as Record<string, unknown> | undefined,
       });
       if (existed) counts.updated++;
       else counts.inserted++;
@@ -106,28 +109,35 @@ interface ContactUpsert {
   name: string;
   org?: string;
   assignTags: string[];
+  existing?: Record<string, unknown>;
 }
 
 async function upsertContact(c: ContactUpsert): Promise<boolean> {
-  const existing = await ddb.send(
-    new GetCommand({ TableName: TABLE, Key: { PK: `CONTACT#${c.email}`, SK: 'PROFILE' } }),
-  );
-  const existed = !!existing.Item;
-  const prevTags = (existing.Item?.tags as string[] | undefined) ?? [];
+  const existing = c.existing;
+  const existed = !!existing;
+  const prevTags = (existing?.tags as string[] | undefined) ?? [];
   const newTags = c.assignTags.filter((t) => !prevTags.includes(t));
   const tags = newTags.length > 0 ? [...prevTags, ...newTags] : prevTags;
   const now = new Date().toISOString();
+  const status =
+    existing?.status === 'unsubscribed' || existing?.status === 'bounced'
+      ? existing.status
+      : 'active';
 
   const profile = {
     PK: `CONTACT#${c.email}`,
     SK: 'PROFILE',
     email: c.email,
-    name: c.name || existing.Item?.name || c.email.split('@')[0],
-    org: c.org ?? existing.Item?.org,
+    name: c.name || existing?.name || c.email.split('@')[0],
+    org: c.org ?? existing?.org,
     tags,
-    status: existing.Item?.status ?? 'active',
-    joined: existing.Item?.joined ?? now.slice(0, 10),
+    status,
+    joined: existing?.joined ?? now.slice(0, 10),
     updatedAt: now,
+    suppressed: existing?.suppressed === true,
+    suppressedAt: existing?.suppressedAt,
+    suppressionReason: existing?.suppressionReason,
+    ...contactStatusIndexFields(c.email, status),
   };
 
   const requests: { PutRequest?: unknown; DeleteRequest?: unknown }[] = [
@@ -144,20 +154,8 @@ async function upsertContact(c: ContactUpsert): Promise<boolean> {
       },
     })),
   ];
-  await batchWrite(requests);
+  await batchWriteAll(ddb, TABLE, requests);
   return existed;
-}
-
-async function isSuppressed(email: string): Promise<boolean> {
-  const res = await ddb.send(
-    new QueryCommand({
-      TableName: TABLE,
-      KeyConditionExpression: 'PK = :pk',
-      ExpressionAttributeValues: { ':pk': `SUPP#${email}` },
-      Limit: 1,
-    }),
-  );
-  return (res.Count ?? 0) > 0;
 }
 
 async function setImportStatus(
@@ -182,14 +180,6 @@ async function setImportStatus(
   );
 }
 
-async function batchWrite(requests: { PutRequest?: unknown; DeleteRequest?: unknown }[]): Promise<void> {
-  for (let i = 0; i < requests.length; i += 25) {
-    const chunk = requests.slice(i, i + 25);
-    if (chunk.length === 0) continue;
-    await ddb.send(new BatchWriteCommand({ RequestItems: { [TABLE]: chunk as never[] } }));
-  }
-}
-
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 async function readObject(bucket: string, key: string): Promise<string> {
@@ -201,6 +191,10 @@ function extractImportId(key: string): string | null {
   // imports/<uuid>.csv
   const m = key.match(/^imports\/([0-9a-f-]{36})\.csv$/i);
   return m ? m[1] : null;
+}
+
+function existingSuppressed(item: Record<string, unknown> | undefined): boolean {
+  return item?.suppressed === true;
 }
 
 /**

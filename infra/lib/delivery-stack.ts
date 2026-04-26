@@ -12,6 +12,7 @@ import { Topic } from 'aws-cdk-lib/aws-sns';
 import { Queue } from 'aws-cdk-lib/aws-sqs';
 import { Table } from 'aws-cdk-lib/aws-dynamodb';
 import { PolicyStatement, Effect } from 'aws-cdk-lib/aws-iam';
+import { Secret } from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 import * as path from 'path';
 import { DispatchConfig } from './config';
@@ -20,6 +21,7 @@ export interface DeliveryStackProps extends StackProps {
   config: DispatchConfig;
   table: Table;
   sendQueue: Queue;
+  unsubscribeSecret: Secret;
 }
 
 /**
@@ -49,7 +51,7 @@ export class DeliveryStack extends Stack {
 
   constructor(scope: Construct, id: string, props: DeliveryStackProps) {
     super(scope, id, props);
-    const { config, table, sendQueue } = props;
+    const { config, table, sendQueue, unsubscribeSecret } = props;
     const repoRoot = path.resolve(__dirname, '../..');
     const sendingDomain = config.sendingDomain;
     const publicBaseUrl = `https://${config.publicHost}`;
@@ -122,10 +124,12 @@ export class DeliveryStack extends Stack {
         CONFIG_SET_NAME: this.configSet.name!,
         FROM_ADDRESS: this.fromAddress,
         PUBLIC_BASE_URL: publicBaseUrl,
+        UNSUB_SECRET: unsubscribeSecret.secretValue.unsafeUnwrap(),
       },
     });
 
     table.grantReadWriteData(this.workerSend);
+    unsubscribeSecret.grantRead(this.workerSend);
     this.workerSend.addEventSource(
       new SqsEventSource(sendQueue, {
         batchSize: 10,

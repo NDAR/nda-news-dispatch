@@ -1,18 +1,22 @@
-import type { APIGatewayProxyHandler, APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import type { APIGatewayProxyHandler, APIGatewayProxyResult } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
   DynamoDBDocumentClient,
   PutCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
+import {
+  contactStatusIndexFields,
+  suppressionState,
+  verifyUnsubscribeToken,
+} from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
 });
 
 const TABLE = mustEnv('TABLE_NAME');
-const UNSUB_SECRET = process.env.UNSUB_SECRET ?? `dev-${TABLE}`;
+const UNSUB_SECRET = mustEnv('UNSUB_SECRET');
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -51,6 +55,7 @@ export const handler: APIGatewayProxyHandler = async (event) => {
 
 async function recordUnsubscribe(campaignId: string, email: string): Promise<void> {
   const at = new Date().toISOString();
+  const suppression = suppressionState('unsubscribe', at);
   await Promise.all([
     ddb.send(
       new PutCommand({
@@ -70,10 +75,19 @@ async function recordUnsubscribe(campaignId: string, email: string): Promise<voi
       new UpdateCommand({
         TableName: TABLE,
         Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' },
-        UpdateExpression: 'SET #s = :s, unsubscribedAt = :u, updatedAt = :u',
+        UpdateExpression:
+          'SET #s = :s, unsubscribedAt = :u, updatedAt = :u, suppressed = :suppressed, suppressedAt = :suppressedAt, suppressionReason = :suppressionReason, GSI2PK = :gsi2pk, GSI2SK = :gsi2sk',
         ConditionExpression: 'attribute_exists(PK)',
         ExpressionAttributeNames: { '#s': 'status' },
-        ExpressionAttributeValues: { ':s': 'unsubscribed', ':u': at },
+        ExpressionAttributeValues: {
+          ':s': 'unsubscribed',
+          ':u': at,
+          ':suppressed': suppression.suppressed,
+          ':suppressedAt': suppression.suppressedAt,
+          ':suppressionReason': suppression.suppressionReason,
+          ':gsi2pk': contactStatusIndexFields(email, 'unsubscribed').GSI2PK,
+          ':gsi2sk': contactStatusIndexFields(email, 'unsubscribed').GSI2SK,
+        },
       }),
     ).catch(() => { /* contact may not exist in our table (forwarded mail) */ }),
     ddb.send(
@@ -97,15 +111,7 @@ async function recordUnsubscribe(campaignId: string, email: string): Promise<voi
 }
 
 function verifyToken(campaignId: string, email: string, token: string): boolean {
-  const expected = createHmac('sha256', UNSUB_SECRET).update(`${campaignId}|${email}`).digest('base64url');
-  const a = Buffer.from(token);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length) return false;
-  try {
-    return timingSafeEqual(a, b);
-  } catch {
-    return false;
-  }
+  return verifyUnsubscribeToken(UNSUB_SECRET, campaignId, email, token);
 }
 
 function confirmationPage(email: string): string {

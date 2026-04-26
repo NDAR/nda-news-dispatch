@@ -7,6 +7,7 @@ import {
   StreamViewType,
   TableEncryption,
 } from 'aws-cdk-lib/aws-dynamodb';
+import { Secret } from 'aws-cdk-lib/aws-secretsmanager';
 import { Queue, QueueEncryption } from 'aws-cdk-lib/aws-sqs';
 import { Construct } from 'constructs';
 import { DispatchConfig } from './config';
@@ -25,6 +26,7 @@ export class DataStack extends Stack {
   readonly table: Table;
   readonly sendQueue: Queue;
   readonly sendDlq: Queue;
+  readonly unsubscribeSecret: Secret;
 
   constructor(scope: Construct, id: string, props: DataStackProps) {
     super(scope, id, props);
@@ -50,6 +52,21 @@ export class DataStack extends Stack {
       projectionType: ProjectionType.ALL,
     });
 
+    this.table.addGlobalSecondaryIndex({
+      indexName: 'GSI2',
+      partitionKey: { name: 'GSI2PK', type: AttributeType.STRING },
+      sortKey: { name: 'GSI2SK', type: AttributeType.STRING },
+      projectionType: ProjectionType.ALL,
+    });
+
+    this.unsubscribeSecret = new Secret(this, 'UnsubscribeSecret', {
+      secretName: `nda-dispatch-${config.envName}-unsubscribe-secret`,
+      generateSecretString: {
+        excludePunctuation: true,
+      },
+    });
+    this.unsubscribeSecret.applyRemovalPolicy(removalPolicy);
+
     this.sendDlq = new Queue(this, 'sendDlq', {
       queueName: `nda-dispatch-${config.envName}-send-dlq`,
       encryption: QueueEncryption.SQS_MANAGED,
@@ -67,5 +84,6 @@ export class DataStack extends Stack {
     new CfnOutput(this, 'TableName', { value: this.table.tableName });
     new CfnOutput(this, 'TableStreamArn', { value: this.table.tableStreamArn ?? '' });
     new CfnOutput(this, 'SendQueueUrl', { value: this.sendQueue.queueUrl });
+    new CfnOutput(this, 'UnsubscribeSecretArn', { value: this.unsubscribeSecret.secretArn });
   }
 }

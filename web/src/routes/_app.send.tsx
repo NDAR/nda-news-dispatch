@@ -15,6 +15,7 @@ import {
 } from '../api/endpoints';
 import { TypePill } from '../components/types/TypePill';
 import { renderFooterPreviewHtml } from '../lib/footerPreview';
+import { buildPreviewSrcDoc } from '../lib/previewFrame';
 
 export const Route = createFileRoute('/_app/send')({
   component: SendPage,
@@ -424,7 +425,7 @@ function PreviewModal({
     senderAddress: settings?.senderAddress,
     unsubUrl: 'https://example.com/u?c=preview&e=you%40example.com&t=preview',
   });
-  const doc = `<!doctype html>
+  const doc = buildPreviewSrcDoc(`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
@@ -438,7 +439,7 @@ function PreviewModal({
 <body>
 <div class="preview-shell"><div class="preview-body">${template.html}${footer}</div></div>
 </body>
-</html>`;
+</html>`);
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -460,6 +461,7 @@ function PreviewModal({
           <iframe
             title="email-preview"
             srcDoc={doc}
+            sandbox=""
             style={{
               width: '100%',
               height: '100%',

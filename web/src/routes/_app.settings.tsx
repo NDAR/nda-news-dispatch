@@ -6,6 +6,7 @@ import StarterKit from '@tiptap/starter-kit';
 import Link from '@tiptap/extension-link';
 import { getSettings, updateSettings, type OrgSettings } from '../api/endpoints';
 import { renderFooterPreviewHtml } from '../lib/footerPreview';
+import { buildPreviewSrcDoc } from '../lib/previewFrame';
 
 export const Route = createFileRoute('/_app/settings')({
   component: SettingsPage,
@@ -240,13 +241,16 @@ function PreviewPanel({
     </div>
   `;
   const footer = renderFooterPreview(footerHtml, senderName, senderAddress);
-  const html = `<!doctype html><html><body style="margin:0;background:#f9fafb;">${sample}${footer}</body></html>`;
+  const html = buildPreviewSrcDoc(
+    `<!doctype html><html><body style="margin:0;background:#f9fafb;">${sample}${footer}</body></html>`,
+  );
   return (
     <div className="stack" style={{ gap: 6 }}>
       <label className="eyebrow">Preview</label>
       <iframe
         title="Footer preview"
         srcDoc={html}
+        sandbox=""
         style={{
           width: '100%',
           height: 380,

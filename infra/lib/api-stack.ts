@@ -15,6 +15,7 @@ import { UserPool } from 'aws-cdk-lib/aws-cognito';
 import { Table } from 'aws-cdk-lib/aws-dynamodb';
 import { Bucket } from 'aws-cdk-lib/aws-s3';
 import { Queue } from 'aws-cdk-lib/aws-sqs';
+import { Secret } from 'aws-cdk-lib/aws-secretsmanager';
 import { CfnWebACL, CfnWebACLAssociation } from 'aws-cdk-lib/aws-wafv2';
 import { CfnScheduleGroup } from 'aws-cdk-lib/aws-scheduler';
 import { Role, ServicePrincipal, PolicyStatement, Effect } from 'aws-cdk-lib/aws-iam';
@@ -29,6 +30,7 @@ export interface ApiStackProps extends StackProps {
   archiveBucket: Bucket;
   importsBucket: Bucket;
   sendQueue: Queue;
+  unsubscribeSecret: Secret;
 }
 
 export class ApiStack extends Stack {
@@ -36,7 +38,15 @@ export class ApiStack extends Stack {
 
   constructor(scope: Construct, id: string, props: ApiStackProps) {
     super(scope, id, props);
-    const { config, userPool, table, archiveBucket, importsBucket, sendQueue } = props;
+    const {
+      config,
+      userPool,
+      table,
+      archiveBucket,
+      importsBucket,
+      sendQueue,
+      unsubscribeSecret,
+    } = props;
 
     const repoRoot = path.resolve(__dirname, '../..');
     const baseFnProps: Partial<NodejsFunctionProps> = {
@@ -273,9 +283,11 @@ export class ApiStack extends Stack {
       environment: {
         ENV_NAME: config.envName,
         TABLE_NAME: table.tableName,
+        UNSUB_SECRET: unsubscribeSecret.secretValue.unsafeUnwrap(),
       },
     });
     table.grantReadWriteData(unsubscribeFn);
+    unsubscribeSecret.grantRead(unsubscribeFn);
 
     this.api = new RestApi(this, 'DispatchApi', {
       restApiName: `nda-dispatch-api-${config.envName}`,

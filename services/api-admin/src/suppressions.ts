@@ -1,12 +1,15 @@
 import type { APIGatewayProxyHandler, APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
+  DeleteCommand,
   DynamoDBDocumentClient,
+  GetCommand,
   PutCommand,
   QueryCommand,
   ScanCommand,
-  DeleteCommand,
+  UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
+import { contactStatusIndexFields } from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -84,6 +87,29 @@ async function addSuppression(
       },
     }),
   );
+  const existing = await ddb.send(
+    new GetCommand({ TableName: TABLE, Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' } }),
+  );
+  const status =
+    existing.Item?.status === 'unsubscribed' || existing.Item?.status === 'bounced'
+      ? existing.Item.status
+      : 'active';
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' },
+      UpdateExpression:
+        'SET suppressed = :suppressed, suppressedAt = :suppressedAt, suppressionReason = :suppressionReason, GSI2PK = :gsi2pk, GSI2SK = :gsi2sk',
+      ConditionExpression: 'attribute_exists(PK)',
+      ExpressionAttributeValues: {
+        ':suppressed': true,
+        ':suppressedAt': now,
+        ':suppressionReason': reason,
+        ':gsi2pk': contactStatusIndexFields(email, status).GSI2PK,
+        ':gsi2sk': contactStatusIndexFields(email, status).GSI2SK,
+      },
+    }),
+  ).catch(() => undefined);
   return { email, reason };
 }
 
@@ -97,7 +123,7 @@ async function removeSuppression(email: string): Promise<{ email: string; remove
   );
   const items = existing.Items ?? [];
   await Promise.all(
-    items.map((item) =>
+    items.map((item: Record<string, unknown>) =>
       ddb.send(
         new DeleteCommand({
           TableName: TABLE,
@@ -106,6 +132,27 @@ async function removeSuppression(email: string): Promise<{ email: string; remove
       ),
     ),
   );
+  const profile = await ddb.send(
+    new GetCommand({ TableName: TABLE, Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' } }),
+  );
+  const status =
+    profile.Item?.status === 'unsubscribed' || profile.Item?.status === 'bounced'
+      ? profile.Item.status
+      : 'active';
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' },
+      UpdateExpression:
+        'SET suppressed = :suppressed, GSI2PK = :gsi2pk, GSI2SK = :gsi2sk REMOVE suppressedAt, suppressionReason',
+      ConditionExpression: 'attribute_exists(PK)',
+      ExpressionAttributeValues: {
+        ':suppressed': false,
+        ':gsi2pk': contactStatusIndexFields(email, status).GSI2PK,
+        ':gsi2sk': contactStatusIndexFields(email, status).GSI2SK,
+      },
+    }),
+  ).catch(() => undefined);
   return { email, removed: items.length };
 }
 

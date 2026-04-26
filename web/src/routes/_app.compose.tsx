@@ -19,6 +19,7 @@ import {
 } from '../api/endpoints';
 import { AssetPickerModal } from '../components/AssetPickerModal';
 import { TypePill } from '../components/types/TypePill';
+import { buildPreviewSrcDoc } from '../lib/previewFrame';
 
 export const Route = createFileRoute('/_app/compose')({
   component: ComposePage,
@@ -213,7 +214,6 @@ function ComposePage() {
     onError: (e) => console.error('deleteTemplate failed', e),
   });
 
-  const iframeRef = useRef<HTMLIFrameElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [imagePickerOpen, setImagePickerOpen] = useState(false);
 
@@ -347,28 +347,10 @@ function ComposePage() {
     });
   }
 
-  // Live preview: render whatever's currently in the editor (not just the
-  // last saved version) so typing in the textarea is instantly reflected
-  // in the iframe. If the user set an Asset base URL, inject a <base href>
-  // so relative <img>/<a> URLs in the source HTML resolve to the original
-  // host instead of dispatch.scienthouse.io (which 403s for /system/images
-  // and other paths it doesn't own).
-  useEffect(() => {
-    const doc = iframeRef.current?.contentDocument;
-    if (!doc) return;
-    let html = localHtml || '<!doctype html><html><body></body></html>';
-    if (assetBase) {
-      const baseTag = `<base href="${assetBase.replace(/"/g, '&quot;')}">`;
-      if (/<head[^>]*>/i.test(html)) {
-        html = html.replace(/<head[^>]*>/i, (m) => `${m}${baseTag}`);
-      } else {
-        html = `${baseTag}${html}`;
-      }
-    }
-    doc.open();
-    doc.write(html);
-    doc.close();
-  }, [localHtml, assetBase, current?.id]);
+  const previewDoc = useMemo(
+    () => buildPreviewSrcDoc(localHtml, { baseHref: assetBase || undefined }),
+    [assetBase, localHtml],
+  );
 
   // Debounced autosave — fires 750ms after the last keystroke. We use the
   // currentRef (declared above) so the timer never fires against a stale id
@@ -666,7 +648,13 @@ function ComposePage() {
                 />
               </div>
               <div className="split-pane-body preview-shell">
-                <iframe ref={iframeRef} className="preview-page" style={{ border: 'none' }} title="preview" />
+                <iframe
+                  className="preview-page"
+                  style={{ border: 'none' }}
+                  title="preview"
+                  srcDoc={previewDoc}
+                  sandbox=""
+                />
               </div>
             </div>
           </div>

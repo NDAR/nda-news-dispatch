@@ -14,6 +14,7 @@ import { LineChart } from '../components/metrics/LineChart';
 import { StatusPill } from '../components/metrics/StatusPill';
 import { TypePill } from '../components/types/TypePill';
 import { formatNumber, formatPct, formatDateTime } from '../lib/format';
+import { buildPreviewSrcDoc } from '../lib/previewFrame';
 
 export const Route = createFileRoute('/_app/history/$campaignId')({
   component: CampaignDetailPage,
@@ -469,7 +470,8 @@ function ContentModal({
         <div className="modal-body" style={{ flex: 1, padding: '8px 16px 16px' }}>
           <iframe
             title="campaign-content"
-            srcDoc={html}
+            srcDoc={buildPreviewSrcDoc(html)}
+            sandbox=""
             style={{
               width: '100%',
               height: '100%',

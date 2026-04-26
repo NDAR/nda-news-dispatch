@@ -7,16 +7,20 @@ import {
   PutCommand,
   QueryCommand,
   UpdateCommand,
-  BatchWriteCommand,
-  BatchGetCommand,
 } from '@aws-sdk/lib-dynamodb';
-import { SQSClient, SendMessageBatchCommand } from '@aws-sdk/client-sqs';
+import { SQSClient, type SendMessageBatchRequestEntry } from '@aws-sdk/client-sqs';
 import {
   SchedulerClient,
   CreateScheduleCommand,
   DeleteScheduleCommand,
   FlexibleTimeWindowMode,
 } from '@aws-sdk/client-scheduler';
+import {
+  batchGetAll,
+  batchWriteAll,
+  materializeAudienceEmails,
+  sendMessageBatchAll,
+} from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -133,21 +137,14 @@ async function listCampaigns(
 async function batchGetStats(ids: string[]): Promise<Map<string, Record<string, number>>> {
   const out = new Map<string, Record<string, number>>();
   if (ids.length === 0) return out;
-  for (let i = 0; i < ids.length; i += 100) {
-    const chunk = ids.slice(i, i + 100);
-    const res = await ddb.send(
-      new BatchGetCommand({
-        RequestItems: {
-          [TABLE]: {
-            Keys: chunk.map((id) => ({ PK: `CAMPAIGN#${id}`, SK: 'STATS' })),
-          },
-        },
-      }),
-    );
-    for (const item of res.Responses?.[TABLE] ?? []) {
-      const id = String(item.PK).replace(/^CAMPAIGN#/, '');
-      out.set(id, stripKeys(item) as Record<string, number>);
-    }
+  const items = await batchGetAll<Record<string, unknown>>(
+    ddb,
+    TABLE,
+    ids.map((campaignId) => ({ PK: `CAMPAIGN#${campaignId}`, SK: 'STATS' })),
+  );
+  for (const item of items) {
+    const id = String(item.PK).replace(/^CAMPAIGN#/, '');
+    out.set(id, stripKeys(item) as Record<string, number>);
   }
   return out;
 }
@@ -197,7 +194,7 @@ async function listCampaignRecipients(
       }),
     );
     for (const it of res.Items ?? []) {
-      items.push(stripKeys(it) as CampaignRecipient);
+      items.push(stripKeys(it) as unknown as CampaignRecipient);
       if (items.length >= RECIPIENTS_CAP) {
         truncated = true;
         break;
@@ -215,7 +212,7 @@ async function getCampaign(id: string): Promise<CampaignRecord & { stats: Record
   ]);
   if (!meta.Item) throw new HttpError(404, 'not-found', `Campaign ${id} not found`);
   return {
-    ...(stripKeys(meta.Item) as CampaignRecord),
+    ...(stripKeys(meta.Item) as unknown as CampaignRecord),
     stats: (stats.Item ? stripKeys(stats.Item) : {}) as Record<string, number>,
   };
 }
@@ -274,16 +271,10 @@ async function deleteCampaign(id: string): Promise<{ id: string; deleted: true }
   if (existing.status !== 'draft') {
     throw new HttpError(409, 'illegal-state', 'Only drafts can be deleted');
   }
-  await ddb.send(
-    new BatchWriteCommand({
-      RequestItems: {
-        [TABLE]: [
-          { DeleteRequest: { Key: { PK: `CAMPAIGN#${id}`, SK: 'META' } } },
-          { DeleteRequest: { Key: { PK: `CAMPAIGN#${id}`, SK: 'STATS' } } },
-        ] as never[],
-      },
-    }),
-  );
+  await batchWriteAll(ddb, TABLE, [
+    { DeleteRequest: { Key: { PK: `CAMPAIGN#${id}`, SK: 'META' } } },
+    { DeleteRequest: { Key: { PK: `CAMPAIGN#${id}`, SK: 'STATS' } } },
+  ]);
   return { id, deleted: true };
 }
 
@@ -294,46 +285,31 @@ async function sendCampaign(
 ): Promise<{ id: string; status: string; enqueued: number; scheduleAt?: string }> {
   const meta = await ddb.send(new GetCommand({ TableName: TABLE, Key: { PK: `CAMPAIGN#${id}`, SK: 'META' } }));
   if (!meta.Item) throw new HttpError(404, 'not-found', `Campaign ${id} not found`);
-  if (meta.Item.status !== 'draft') {
-    throw new HttpError(409, 'illegal-state', `Campaign is already ${meta.Item.status}`);
-  }
 
   const tagMode = input.tagMode === 'any' ? 'any' : 'all';
   const tags = validTags(input.tags);
   const excludeTags = validTags(input.excludeTags);
   const testOnly = !!input.testOnly;
+  const actor = claims.email ?? claims.sub ?? 'unknown';
 
-  // ── Scheduled branch ────────────────────────────────────────────────────
-  // We persist the filter on the META row so the dispatch worker can rebuild
-  // the audience at fire time (membership may change between scheduling and
-  // dispatch — new subscribers should be included, unsubscribes excluded).
-  if (input.scheduleAt && !testOnly) {
+  if (testOnly) {
+    await materializeAudienceEmails(ddb, TABLE, { tagMode, tags, excludeTags });
+    return { id, status: 'draft', enqueued: 0 };
+  }
+
+  if (input.scheduleAt) {
     const scheduleAt = validateScheduleAt(input.scheduleAt);
     if (!SCHEDULE_GROUP || !SCHEDULE_EXEC_ROLE_ARN || !DISPATCH_FN_ARN) {
       throw new HttpError(503, 'scheduler-unconfigured', 'Scheduled sends are not enabled in this environment');
     }
 
-    // Persist the schedule + filter onto the META row first. If schedule
-    // creation fails afterwards we'll roll the status back.
-    const sentBy = claims.email ?? claims.sub ?? 'unknown';
-    await ddb.send(
-      new UpdateCommand({
-        TableName: TABLE,
-        Key: { PK: `CAMPAIGN#${id}`, SK: 'META' },
-        UpdateExpression:
-          'SET #s = :s, tags = :t, excludeTags = :x, tagMode = :m, GSI1PK = :gpk, scheduleAt = :sched, scheduledBy = :sb',
-        ExpressionAttributeNames: { '#s': 'status' },
-        ExpressionAttributeValues: {
-          ':s': 'scheduled',
-          ':t': tags,
-          ':x': excludeTags,
-          ':m': tagMode,
-          ':gpk': 'STATUS#scheduled',
-          ':sched': scheduleAt,
-          ':sb': sentBy,
-        },
-      }),
-    );
+    await claimStatusFromDraft(id, 'scheduled', {
+      tags,
+      excludeTags,
+      tagMode,
+      actor,
+      scheduleAt,
+    });
 
     try {
       await scheduler.send(
@@ -352,89 +328,163 @@ async function sendCampaign(
         }),
       );
     } catch (e) {
-      // Roll the campaign back to draft so the user can retry without
-      // having to manually clean up DDB state.
-      await ddb.send(
-        new UpdateCommand({
-          TableName: TABLE,
-          Key: { PK: `CAMPAIGN#${id}`, SK: 'META' },
-          UpdateExpression: 'SET #s = :s, GSI1PK = :gpk REMOVE scheduleAt, scheduledBy',
-          ExpressionAttributeNames: { '#s': 'status' },
-          ExpressionAttributeValues: {
-            ':s': 'draft',
-            ':gpk': 'STATUS#draft',
-          },
-        }),
-      ).catch(() => undefined);
+      await rollbackScheduledDraft(id).catch(() => undefined);
       throw e;
     }
 
     return { id, status: 'scheduled', enqueued: 0, scheduleAt };
   }
 
-  // ── Immediate-send branch (existing behavior) ───────────────────────────
-  const recipients = await materializeRecipients({ tagMode, tags, excludeTags });
-  if (recipients.length === 0) throw new HttpError(400, 'empty-audience', 'No recipients match the filters');
-
   const subject = String(meta.Item.subject);
   const html = String(meta.Item.html);
   const now = new Date().toISOString();
+  await claimStatusFromDraft(id, 'sending', { tags, excludeTags, tagMode, actor });
 
-  // Write RCPT items (25/batch), then enqueue SQS messages (10/batch).
-  const rcptItems = recipients.map((email) => ({
-    PutRequest: {
-      Item: {
-        PK: `CAMPAIGN#${id}`,
-        SK: `RCPT#${email}`,
-        GSI1PK: `RCPT#${email}`,
-        GSI1SK: id,
-        email,
-        state: 'pending',
-        queuedAt: now,
-      },
-    },
-  }));
-  await batchWrite(rcptItems);
-
-  let enqueued = 0;
-  if (!testOnly) {
-    for (let i = 0; i < recipients.length; i += 10) {
-      const chunk = recipients.slice(i, i + 10);
-      await sqs.send(
-        new SendMessageBatchCommand({
-          QueueUrl: SEND_QUEUE_URL,
-          Entries: chunk.map((email, idx) => ({
-            Id: `${i + idx}`,
-            MessageBody: JSON.stringify({ campaignId: id, email, subject, html }),
-          })),
-        }),
-      );
-      enqueued += chunk.length;
+  try {
+    const recipients = await materializeAudienceEmails(ddb, TABLE, { tagMode, tags, excludeTags });
+    if (recipients.length === 0) {
+      throw new HttpError(400, 'empty-audience', 'No recipients match the filters');
     }
-  }
 
-  const nextStatus = testOnly ? 'draft' : 'queued';
+    await createStatsRow(id);
+    await batchWriteAll(ddb, TABLE, buildRecipientRows(id, recipients, now));
+    const enqueued = await enqueueCampaignMessages(id, recipients, subject, html);
+
+    await markStatus(id, 'queued', { sentAt: now, recipients: recipients.length });
+    return { id, status: 'queued', enqueued };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await markStatus(id, 'failed', { sentAt: now, error: msg });
+    throw e;
+  }
+}
+
+/**
+ * Cancels a scheduled campaign by deleting its EventBridge schedule and
+ * reverting the META row to 'draft'. No-op if the campaign isn't scheduled.
+ */
+async function cancelScheduledCampaign(id: string): Promise<{ id: string; status: 'draft' }> {
+  const meta = await ddb.send(new GetCommand({ TableName: TABLE, Key: { PK: `CAMPAIGN#${id}`, SK: 'META' } }));
+  if (!meta.Item) throw new HttpError(404, 'not-found', `Campaign ${id} not found`);
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { PK: `CAMPAIGN#${id}`, SK: 'META' },
+        UpdateExpression: 'SET #s = :s, GSI1PK = :gpk REMOVE scheduleAt, scheduledBy',
+        ConditionExpression: '#s = :scheduled',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: {
+          ':s': 'draft',
+          ':gpk': 'STATUS#draft',
+          ':scheduled': 'scheduled',
+        },
+      }),
+    );
+  } catch (e) {
+    if (isConditionalFailure(e)) {
+      throw new HttpError(409, 'illegal-state', 'Campaign is no longer scheduled');
+    }
+    throw e;
+  }
+  if (SCHEDULE_GROUP) {
+    await scheduler.send(
+      new DeleteScheduleCommand({ Name: `dispatch-${id}`, GroupName: SCHEDULE_GROUP }),
+    ).catch((e) => {
+      // ResourceNotFound means the schedule fired (or was already cleaned up).
+      // Either way we can safely revert the campaign to draft.
+      console.warn(JSON.stringify({ level: 'warn', msg: 'cancel-schedule-delete-failed', id, err: String(e) }));
+    });
+  }
+  return { id, status: 'draft' };
+}
+
+function validateScheduleAt(input: string): string {
+  const t = Date.parse(input);
+  if (Number.isNaN(t)) throw new HttpError(400, 'invalid-schedule', 'scheduleAt must be a valid ISO timestamp');
+  if (t < Date.now() + MIN_SCHEDULE_LEAD_MS) {
+    throw new HttpError(400, 'invalid-schedule', 'scheduleAt must be at least 1 minute in the future');
+  }
+  return new Date(t).toISOString();
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function toGsiItem(c: CampaignRecord): Record<string, unknown> {
+  return {
+    PK: `CAMPAIGN#${c.id}`,
+    SK: 'META',
+    GSI1PK: `STATUS#${c.status}`,
+    GSI1SK: c.createdAt,
+    ...c,
+  };
+}
+
+function stripKeys(item: Record<string, unknown>): Record<string, unknown> {
+  const { PK, SK, GSI1PK, GSI1SK, ...rest } = item as Record<string, unknown>;
+  void PK; void SK; void GSI1PK; void GSI1SK;
+  return rest;
+}
+
+async function claimStatusFromDraft(
+  id: string,
+  nextStatus: 'scheduled' | 'sending',
+  opts: {
+    tags: string[];
+    excludeTags: string[];
+    tagMode: 'all' | 'any';
+    actor: string;
+    scheduleAt?: string;
+  },
+): Promise<void> {
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { PK: `CAMPAIGN#${id}`, SK: 'META' },
+        UpdateExpression:
+          'SET #s = :s, tags = :t, excludeTags = :x, tagMode = :m, GSI1PK = :gpk, sentBy = :sb' +
+          (opts.scheduleAt ? ', scheduleAt = :sched, scheduledBy = :sb' : ' REMOVE scheduleAt, scheduledBy'),
+        ConditionExpression: '#s = :draft',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: {
+          ':s': nextStatus,
+          ':draft': 'draft',
+          ':t': opts.tags,
+          ':x': opts.excludeTags,
+          ':m': opts.tagMode,
+          ':gpk': `STATUS#${nextStatus}`,
+          ':sb': opts.actor,
+          ':sched': opts.scheduleAt,
+        },
+      }),
+    );
+  } catch (e) {
+    if (isConditionalFailure(e)) {
+      throw new HttpError(409, 'illegal-state', 'Campaign is no longer a draft');
+    }
+    throw e;
+  }
+}
+
+async function rollbackScheduledDraft(id: string): Promise<void> {
   await ddb.send(
     new UpdateCommand({
       TableName: TABLE,
       Key: { PK: `CAMPAIGN#${id}`, SK: 'META' },
-      UpdateExpression:
-        'SET #s = :s, recipients = :r, tags = :t, excludeTags = :x, tagMode = :m, GSI1PK = :gpk, sentAt = :sa, sentBy = :sb',
+      UpdateExpression: 'SET #s = :s, GSI1PK = :gpk REMOVE scheduleAt, scheduledBy',
+      ConditionExpression: '#s = :scheduled',
       ExpressionAttributeNames: { '#s': 'status' },
       ExpressionAttributeValues: {
-        ':s': nextStatus,
-        ':r': recipients.length,
-        ':t': tags,
-        ':x': excludeTags,
-        ':m': tagMode,
-        ':gpk': `STATUS#${nextStatus}`,
-        ':sa': now,
-        ':sb': claims.email ?? claims.sub ?? 'unknown',
+        ':s': 'draft',
+        ':gpk': 'STATUS#draft',
+        ':scheduled': 'scheduled',
       },
     }),
   );
+}
 
-  // Initialize stats row (idempotent).
+async function createStatsRow(id: string): Promise<void> {
   await ddb.send(
     new PutCommand({
       TableName: TABLE,
@@ -450,208 +500,97 @@ async function sendCampaign(
       },
       ConditionExpression: 'attribute_not_exists(PK)',
     }),
-  ).catch(() => { /* already exists */ });
-
-  return { id, status: nextStatus, enqueued };
+  ).catch(() => undefined);
 }
 
-/**
- * Cancels a scheduled campaign by deleting its EventBridge schedule and
- * reverting the META row to 'draft'. No-op if the campaign isn't scheduled.
- */
-async function cancelScheduledCampaign(id: string): Promise<{ id: string; status: 'draft' }> {
-  const meta = await ddb.send(new GetCommand({ TableName: TABLE, Key: { PK: `CAMPAIGN#${id}`, SK: 'META' } }));
-  if (!meta.Item) throw new HttpError(404, 'not-found', `Campaign ${id} not found`);
-  if (meta.Item.status !== 'scheduled') {
-    throw new HttpError(409, 'illegal-state', `Campaign is ${meta.Item.status}, not scheduled`);
-  }
-  if (SCHEDULE_GROUP) {
-    await scheduler.send(
-      new DeleteScheduleCommand({ Name: `dispatch-${id}`, GroupName: SCHEDULE_GROUP }),
-    ).catch((e) => {
-      // ResourceNotFound means the schedule fired (or was already cleaned up).
-      // Either way we can safely revert the campaign to draft.
-      console.warn(JSON.stringify({ level: 'warn', msg: 'cancel-schedule-delete-failed', id, err: String(e) }));
-    });
-  }
+async function markStatus(
+  id: string,
+  status: 'queued' | 'failed',
+  extras: { sentAt?: string; recipients?: number; error?: string } = {},
+): Promise<void> {
+  const parts = ['#s = :s', 'GSI1PK = :gpk'];
+  const values: Record<string, unknown> = { ':s': status, ':gpk': `STATUS#${status}` };
+  const names: Record<string, string> = { '#s': 'status' };
+  if (extras.sentAt) { parts.push('sentAt = :sa'); values[':sa'] = extras.sentAt; }
+  if (extras.recipients !== undefined) { parts.push('recipients = :r'); values[':r'] = extras.recipients; }
+  if (extras.error) { parts.push('#e = :e'); values[':e'] = extras.error; names['#e'] = 'error'; }
   await ddb.send(
     new UpdateCommand({
       TableName: TABLE,
       Key: { PK: `CAMPAIGN#${id}`, SK: 'META' },
-      UpdateExpression: 'SET #s = :s, GSI1PK = :gpk REMOVE scheduleAt, scheduledBy',
-      ExpressionAttributeNames: { '#s': 'status' },
-      ExpressionAttributeValues: { ':s': 'draft', ':gpk': 'STATUS#draft' },
+      UpdateExpression: 'SET ' + parts.join(', '),
+      ExpressionAttributeValues: values,
+      ExpressionAttributeNames: names,
     }),
   );
-  return { id, status: 'draft' };
 }
 
-function validateScheduleAt(input: string): string {
-  const t = Date.parse(input);
-  if (Number.isNaN(t)) throw new HttpError(400, 'invalid-schedule', 'scheduleAt must be a valid ISO timestamp');
-  if (t < Date.now() + MIN_SCHEDULE_LEAD_MS) {
-    throw new HttpError(400, 'invalid-schedule', 'scheduleAt must be at least 1 minute in the future');
-  }
-  return new Date(t).toISOString();
+function buildRecipientRows(
+  campaignId: string,
+  recipients: string[],
+  queuedAt: string,
+): { PutRequest?: unknown; DeleteRequest?: unknown }[] {
+  return recipients.map((email) => ({
+    PutRequest: {
+      Item: {
+        PK: `CAMPAIGN#${campaignId}`,
+        SK: `RCPT#${email}`,
+        GSI1PK: `RCPT#${email}`,
+        GSI1SK: campaignId,
+        email,
+        state: 'pending',
+        queuedAt,
+      },
+    },
+  }));
 }
 
-// ── Recipient materialization ──────────────────────────────────────────────
-
-async function materializeRecipients(opts: {
-  tagMode: 'all' | 'any';
-  tags: string[];
-  excludeTags: string[];
-}): Promise<string[]> {
-  const tagSets = await Promise.all(opts.tags.map((t) => queryTag(t)));
-  const excludeSets = await Promise.all(opts.excludeTags.map((t) => queryTag(t)));
-  const excluded = union(excludeSets);
-
-  let base: Set<string>;
-  if (tagSets.length === 0) {
-    // No tag filter → all active contacts. Only used for small lists;
-    // larger sends should always specify filters.
-    base = await listAllActiveContacts();
-  } else if (opts.tagMode === 'all') {
-    base = intersect(tagSets);
-  } else {
-    base = union(tagSets);
-  }
-
-  const candidates = [...base].filter((e) => !excluded.has(e));
-
-  // Filter out inactive + suppressed.
-  const profiles = await batchGetStatusAndSuppression(candidates);
-  return candidates.filter((e) => {
-    const p = profiles.get(e);
-    if (!p) return false;
-    if (p.status !== 'active') return false;
-    if (p.suppressed) return false;
-    return true;
-  });
-}
-
-async function queryTag(tag: string): Promise<Set<string>> {
-  const out = new Set<string>();
-  let cursor: Record<string, unknown> | undefined;
-  do {
-    const res = await ddb.send(
-      new QueryCommand({
-        TableName: TABLE,
-        IndexName: 'GSI1',
-        KeyConditionExpression: 'GSI1PK = :pk',
-        ExpressionAttributeValues: { ':pk': `TAG#${tag}` },
-        ExclusiveStartKey: cursor,
-      }),
+async function enqueueCampaignMessages(
+  campaignId: string,
+  recipients: string[],
+  subject: string,
+  html: string,
+): Promise<number> {
+  const entries: SendMessageBatchRequestEntry[] = recipients.map((email, index) => ({
+    Id: `${index}`,
+    MessageBody: JSON.stringify({ campaignId, email, subject, html }),
+  }));
+  const result = await sendMessageBatchAll(sqs, SEND_QUEUE_URL, entries);
+  if (result.failed.length > 0) {
+    await markRecipientEnqueueFailures(
+      campaignId,
+      result.failed.map((failure) => ({
+        email: recipients[Number(failure.entry.Id)],
+        message: failure.message ?? failure.code ?? 'SQS enqueue failed',
+      })),
     );
-    for (const item of res.Items ?? []) out.add(String(item.email));
-    cursor = res.LastEvaluatedKey;
-  } while (cursor);
-  return out;
-}
-
-async function listAllActiveContacts(): Promise<Set<string>> {
-  // NOTE: uses Scan for simplicity; migrate to a by-status GSI when list grows.
-  const { ScanCommand } = await import('@aws-sdk/lib-dynamodb');
-  const out = new Set<string>();
-  let cursor: Record<string, unknown> | undefined;
-  do {
-    const res = await ddb.send(
-      new ScanCommand({
-        TableName: TABLE,
-        FilterExpression: 'SK = :sk AND begins_with(PK, :p) AND #s = :active',
-        ExpressionAttributeNames: { '#s': 'status' },
-        ExpressionAttributeValues: { ':sk': 'PROFILE', ':p': 'CONTACT#', ':active': 'active' },
-        ExclusiveStartKey: cursor,
-      }),
-    );
-    for (const item of res.Items ?? []) out.add(String(item.email));
-    cursor = res.LastEvaluatedKey;
-  } while (cursor);
-  return out;
-}
-
-async function batchGetStatusAndSuppression(
-  emails: string[],
-): Promise<Map<string, { status: string; suppressed: boolean }>> {
-  const out = new Map<string, { status: string; suppressed: boolean }>();
-  if (emails.length === 0) return out;
-
-  // Profiles.
-  for (let i = 0; i < emails.length; i += 100) {
-    const chunk = emails.slice(i, i + 100);
-    const res = await ddb.send(
-      new BatchGetCommand({
-        RequestItems: {
-          [TABLE]: {
-            Keys: chunk.map((e) => ({ PK: `CONTACT#${e}`, SK: 'PROFILE' })),
-          },
-        },
-      }),
-    );
-    for (const item of res.Responses?.[TABLE] ?? []) {
-      out.set(String(item.email), { status: String(item.status ?? 'active'), suppressed: false });
-    }
+    throw new Error(`Failed to enqueue ${result.failed.length} recipient(s)`);
   }
+  return result.successful.length;
+}
 
-  // Suppression markers (one query per email — fine for MVP audiences).
+async function markRecipientEnqueueFailures(
+  campaignId: string,
+  failures: { email: string; message: string }[],
+): Promise<void> {
+  const at = new Date().toISOString();
   await Promise.all(
-    emails.map(async (email) => {
-      const res = await ddb.send(
-        new QueryCommand({
+    failures.map(({ email, message }) =>
+      ddb.send(
+        new UpdateCommand({
           TableName: TABLE,
-          KeyConditionExpression: 'PK = :pk',
-          ExpressionAttributeValues: { ':pk': `SUPP#${email}` },
-          Limit: 1,
+          Key: { PK: `CAMPAIGN#${campaignId}`, SK: `RCPT#${email}` },
+          UpdateExpression: 'SET #s = :s, failedAt = :at, #e = :e',
+          ExpressionAttributeNames: { '#s': 'state', '#e': 'error' },
+          ExpressionAttributeValues: { ':s': 'failed', ':at': at, ':e': message },
         }),
-      );
-      if ((res.Count ?? 0) > 0) {
-        const entry = out.get(email) ?? { status: 'active', suppressed: false };
-        entry.suppressed = true;
-        out.set(email, entry);
-      }
-    }),
+      ),
+    ),
   );
-  return out;
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-function toGsiItem(c: CampaignRecord): Record<string, unknown> {
-  return {
-    PK: `CAMPAIGN#${c.id}`,
-    SK: 'META',
-    GSI1PK: `STATUS#${c.status}`,
-    GSI1SK: c.createdAt,
-    ...c,
-  };
-}
-
-function intersect(sets: Set<string>[]): Set<string> {
-  if (sets.length === 0) return new Set();
-  const [first, ...rest] = sets;
-  const out = new Set<string>();
-  for (const e of first) if (rest.every((s) => s.has(e))) out.add(e);
-  return out;
-}
-
-function union(sets: Set<string>[]): Set<string> {
-  const out = new Set<string>();
-  for (const s of sets) for (const e of s) out.add(e);
-  return out;
-}
-
-async function batchWrite(requests: { PutRequest?: unknown; DeleteRequest?: unknown }[]): Promise<void> {
-  for (let i = 0; i < requests.length; i += 25) {
-    const chunk = requests.slice(i, i + 25);
-    if (chunk.length === 0) continue;
-    await ddb.send(new BatchWriteCommand({ RequestItems: { [TABLE]: chunk as never[] } }));
-  }
-}
-
-function stripKeys(item: Record<string, unknown>): Record<string, unknown> {
-  const { PK, SK, GSI1PK, GSI1SK, ...rest } = item as Record<string, unknown>;
-  void PK; void SK; void GSI1PK; void GSI1SK;
-  return rest;
+function isConditionalFailure(err: unknown): boolean {
+  return (err as { name?: string }).name === 'ConditionalCheckFailedException';
 }
 
 function validTags(v: string[] | undefined): string[] {

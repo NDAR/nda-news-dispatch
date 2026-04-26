@@ -1,15 +1,17 @@
 import type { APIGatewayProxyHandler, APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
-  DynamoDBDocumentClient,
   GetCommand,
-  PutCommand,
-  DeleteCommand,
+  DynamoDBDocumentClient,
   QueryCommand,
   ScanCommand,
-  BatchGetCommand,
-  BatchWriteCommand,
+  PutCommand,
 } from '@aws-sdk/lib-dynamodb';
+import {
+  batchGetAll,
+  batchWriteAll,
+  contactStatusIndexFields,
+} from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -88,7 +90,7 @@ async function listContacts(event: APIGatewayProxyEvent): Promise<{ items: Conta
     // Tag rows project `email` directly (see writeContact); GSI1SK is the
     // composite `CONTACT#<email>`. Using GSI1SK here would double-prefix the
     // PK in batchGetProfiles and produce zero matches.
-    const emails = (idx.Items ?? []).map((i) => String(i.email));
+    const emails = (idx.Items ?? []).map((i: Record<string, unknown>) => String(i.email));
     const profiles = await batchGetProfiles(emails);
     const filtered = status ? profiles.filter((p) => p.status === status) : profiles;
     return { items: filtered, next: idx.LastEvaluatedKey ? encodeCursor(idx.LastEvaluatedKey) : undefined };
@@ -179,13 +181,16 @@ async function deleteContact(email: string): Promise<{ email: string; deleted: t
     { DeleteRequest: { Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' } } },
     ...prevTags.map((t) => ({ DeleteRequest: { Key: { PK: `CONTACT#${email}`, SK: `TAG#${t}` } } })),
   ];
-  await batchWrite(requests);
+  await batchWriteAll(ddb, TABLE, requests);
   return { email, deleted: true };
 }
 
 async function writeContact(c: Contact, prevTags: string[]): Promise<void> {
   const toRemove = prevTags.filter((t) => !c.tags.includes(t));
   const toAdd = c.tags.filter((t) => !prevTags.includes(t));
+  const existing = await ddb.send(
+    new GetCommand({ TableName: TABLE, Key: { PK: `CONTACT#${c.email}`, SK: 'PROFILE' } }),
+  );
 
   await ddb.send(
     new PutCommand({
@@ -200,6 +205,10 @@ async function writeContact(c: Contact, prevTags: string[]): Promise<void> {
         status: c.status,
         joined: c.joined,
         updatedAt: c.updatedAt,
+        suppressed: existing.Item?.suppressed === true,
+        suppressedAt: existing.Item?.suppressedAt,
+        suppressionReason: existing.Item?.suppressionReason,
+        ...contactStatusIndexFields(c.email, c.status),
       },
     }),
   );
@@ -218,34 +227,17 @@ async function writeContact(c: Contact, prevTags: string[]): Promise<void> {
       },
     })),
   ];
-  await batchWrite(tagRequests);
+  await batchWriteAll(ddb, TABLE, tagRequests);
 }
 
 async function batchGetProfiles(emails: string[]): Promise<Contact[]> {
   if (emails.length === 0) return [];
-  const out: Contact[] = [];
-  for (let i = 0; i < emails.length; i += 100) {
-    const chunk = emails.slice(i, i + 100);
-    const res = await ddb.send(
-      new BatchGetCommand({
-        RequestItems: {
-          [TABLE]: {
-            Keys: chunk.map((e) => ({ PK: `CONTACT#${e}`, SK: 'PROFILE' })),
-          },
-        },
-      }),
-    );
-    for (const item of res.Responses?.[TABLE] ?? []) out.push(toContact(item));
-  }
-  return out;
-}
-
-async function batchWrite(requests: { PutRequest?: unknown; DeleteRequest?: unknown }[]): Promise<void> {
-  for (let i = 0; i < requests.length; i += 25) {
-    const chunk = requests.slice(i, i + 25);
-    if (chunk.length === 0) continue;
-    await ddb.send(new BatchWriteCommand({ RequestItems: { [TABLE]: chunk as never[] } }));
-  }
+  const items = await batchGetAll<Record<string, unknown>>(
+    ddb,
+    TABLE,
+    emails.map((e) => ({ PK: `CONTACT#${e}`, SK: 'PROFILE' })),
+  );
+  return items.map((item) => toContact(item));
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

@@ -1,8 +1,8 @@
 import type { SQSHandler, SQSBatchResponse, SQSRecord } from 'aws-lambda';
-import { createHmac } from 'node:crypto';
 import { SESv2Client, SendEmailCommand } from '@aws-sdk/client-sesv2';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { createUnsubscribeToken } from '../../../packages/shared/src/unsubscribe';
 import { loadSettings, renderFooterHtml, renderFooterText } from './footer';
 
 const ses = new SESv2Client({});
@@ -14,9 +14,7 @@ const TABLE = mustEnv('TABLE_NAME');
 const CONFIG_SET_NAME = mustEnv('CONFIG_SET_NAME');
 const FROM_ADDRESS = mustEnv('FROM_ADDRESS');
 const PUBLIC_BASE_URL = mustEnv('PUBLIC_BASE_URL');
-// UNSUB_SECRET is intentionally derived from table name for MVP; once step 7
-// introduces the public unsubscribe endpoint this will move to SSM.
-const UNSUB_SECRET = process.env.UNSUB_SECRET ?? `dev-${TABLE}`;
+const UNSUB_SECRET = mustEnv('UNSUB_SECRET');
 
 interface SendJob {
   campaignId: string;
@@ -51,7 +49,7 @@ export const handler: SQSHandler = async (event) => {
 
 async function processRecord(record: SQSRecord): Promise<void> {
   const job = JSON.parse(record.body) as SendJob;
-  const token = signUnsubToken(job.campaignId, job.email);
+  const token = createUnsubscribeToken(UNSUB_SECRET, job.campaignId, job.email);
   const unsubUrl = `${PUBLIC_BASE_URL}/public/u?c=${encodeURIComponent(job.campaignId)}&e=${encodeURIComponent(
     job.email,
   )}&t=${token}`;
@@ -103,10 +101,6 @@ async function processRecord(record: SQSRecord): Promise<void> {
       },
     }),
   );
-}
-
-function signUnsubToken(campaignId: string, email: string): string {
-  return createHmac('sha256', UNSUB_SECRET).update(`${campaignId}|${email}`).digest('base64url');
 }
 
 function stripHtml(html: string): string {

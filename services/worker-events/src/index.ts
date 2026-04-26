@@ -5,6 +5,7 @@ import {
   UpdateCommand,
   PutCommand,
 } from '@aws-sdk/lib-dynamodb';
+import { contactStatusIndexFields, suppressionState } from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -170,17 +171,36 @@ async function suppress(email: string, reason: 'bounce' | 'complaint', messageId
   );
 }
 
-async function setContactStatus(email: string, status: string): Promise<void> {
+async function setContactStatus(email: string, status: 'unsubscribed' | 'bounced'): Promise<void> {
+  const at = now();
+  const suppression =
+    status === 'active' ? suppressionState() : suppressionState(status === 'bounced' ? 'bounce' : 'complaint', at);
   await ddb.send(
     new UpdateCommand({
       TableName: TABLE,
       Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' },
-      UpdateExpression: 'SET #s = :s, updatedAt = :u',
+      UpdateExpression:
+        'SET #s = :s, updatedAt = :u, suppressed = :suppressed, GSI2PK = :gsi2pk, GSI2SK = :gsi2sk' +
+        (suppression.suppressedAt ? ', suppressedAt = :suppressedAt, suppressionReason = :suppressionReason' : ''),
       ConditionExpression: 'attribute_exists(PK)',
       ExpressionAttributeNames: { '#s': 'status' },
-      ExpressionAttributeValues: { ':s': status, ':u': now() },
+      ExpressionAttributeValues: {
+        ':s': status,
+        ':u': at,
+        ':suppressed': suppression.suppressed,
+        ':suppressedAt': suppression.suppressedAt,
+        ':suppressionReason': suppression.suppressionReason,
+        ':gsi2pk': contactStatusIndexFields(
+          email,
+          status === 'bounced' ? 'bounced' : 'unsubscribed',
+        ).GSI2PK,
+        ':gsi2sk': contactStatusIndexFields(
+          email,
+          status === 'bounced' ? 'bounced' : 'unsubscribed',
+        ).GSI2SK,
+      },
     }),
-  ).catch((e) => {
+  ).catch((e: unknown) => {
     // missing contact is fine — suppression is still recorded.
     const msg = e instanceof Error ? e.message : String(e);
     console.log(JSON.stringify({ level: 'info', msg: 'skip-contact-status', email, err: msg }));
