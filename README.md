@@ -317,4 +317,35 @@ identity, and Cognito's allowed callback URL.
 
 ## License
 
-Internal — not licensed for external distribution.
+Copyright © 2026 ScientHouse contributors.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the **GNU Affero General Public License v3.0** as published by
+the Free Software Foundation. See [`LICENSE`](./LICENSE) for the full text.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE.
+
+### What AGPL-3.0 means in practice
+
+- You can run, study, modify, and redistribute the source freely.
+- If you **modify the code and let other people use the modified version over
+  a network** (e.g. host it as a SaaS), you must offer those users access to
+  the corresponding source — including your modifications — under the same
+  AGPL-3.0 terms.
+- Internal use within an organization (no third-party network access) does
+  not trigger the source-disclosure requirement.
+- Combining this code with permissively-licensed code (MIT/Apache-2.0) is
+  fine; the combined work is distributed under AGPL-3.0.
+
+If those terms don't fit your use case, contact the maintainers about a
+commercial license.
+
+### Third-party notices
+
+This project bundles or links to permissively-licensed dependencies (React,
+TanStack, TipTap, AWS SDK, AWS CDK, Zod, Vite, etc.) under MIT or Apache-2.0,
+and uses Source Serif 4, Inter, and JetBrains Mono via Google Fonts under the
+SIL Open Font License 1.1. Run `npx license-checker --production --summary`
+from the repo root to regenerate the full attribution list.
