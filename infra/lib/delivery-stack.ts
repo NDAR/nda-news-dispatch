@@ -134,17 +134,22 @@ export class DeliveryStack extends Stack {
       }),
     );
 
-    // ses:SendEmail / ses:SendRawEmail for the configuration set. Scoped to
-    // this identity ARN so the worker can't send from other verified
-    // identities in the account.
+    // ses:SendEmail / ses:SendRawEmail. Resources include identity/* because
+    // SES authorizes against every identity in the request (including the
+    // destination address when it happens to be a verified identity in this
+    // account). The ses:FromAddress condition pins the sender to this domain
+    // so the worker still can't impersonate other senders.
     this.workerSend.addToRolePolicy(
       new PolicyStatement({
         effect: Effect.ALLOW,
         actions: ['ses:SendEmail', 'ses:SendRawEmail'],
         resources: [
-          `arn:aws:ses:${this.region}:${this.account}:identity/${sendingDomain}`,
+          `arn:aws:ses:${this.region}:${this.account}:identity/*`,
           `arn:aws:ses:${this.region}:${this.account}:configuration-set/${this.configSet.name}`,
         ],
+        conditions: {
+          StringLike: { 'ses:FromAddress': `*@${sendingDomain}` },
+        },
       }),
     );
 

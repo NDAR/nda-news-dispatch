@@ -3,6 +3,7 @@ import { createHmac } from 'node:crypto';
 import { SESv2Client, SendEmailCommand } from '@aws-sdk/client-sesv2';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { loadSettings, renderFooterHtml, renderFooterText } from './footer';
 
 const ses = new SESv2Client({});
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
@@ -23,6 +24,9 @@ interface SendJob {
   name?: string;
   subject: string;
   html: string;
+  /** Test sends bypass the per-recipient DDB write — they aren't tied to a
+   *  real campaign and we don't want them polluting STATS or RCPT rows. */
+  test?: boolean;
 }
 
 /**
@@ -58,6 +62,10 @@ async function processRecord(record: SQSRecord): Promise<void> {
     { Name: 'X-Campaign-Id', Value: job.campaignId },
   ];
 
+  const settings = await loadSettings(TABLE);
+  const finalHtml = job.html + renderFooterHtml(settings, unsubUrl);
+  const finalText = stripHtml(job.html) + renderFooterText(settings, unsubUrl);
+
   const res = await ses.send(
     new SendEmailCommand({
       FromEmailAddress: FROM_ADDRESS,
@@ -71,14 +79,16 @@ async function processRecord(record: SQSRecord): Promise<void> {
         Simple: {
           Subject: { Data: job.subject, Charset: 'UTF-8' },
           Body: {
-            Html: { Data: job.html, Charset: 'UTF-8' },
-            Text: { Data: stripHtml(job.html), Charset: 'UTF-8' },
+            Html: { Data: finalHtml, Charset: 'UTF-8' },
+            Text: { Data: finalText, Charset: 'UTF-8' },
           },
           Headers: headers,
         },
       },
     }),
   );
+
+  if (job.test) return;
 
   await ddb.send(
     new UpdateCommand({

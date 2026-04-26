@@ -68,6 +68,10 @@ async function listContacts(event: APIGatewayProxyEvent): Promise<{ items: Conta
   const qs = event.queryStringParameters ?? {};
   const limit = clampInt(qs.limit, 1, 200, 50);
   const next = qs.next;
+  const status = qs.status;
+  if (status && status !== 'active' && status !== 'unsubscribed' && status !== 'bounced') {
+    throw new HttpError(400, 'invalid-status', `Unknown status: ${status}`);
+  }
 
   if (qs.tag) {
     if (!TAG_RE.test(qs.tag)) throw new HttpError(400, 'invalid-tag', 'Invalid tag');
@@ -86,14 +90,29 @@ async function listContacts(event: APIGatewayProxyEvent): Promise<{ items: Conta
     // PK in batchGetProfiles and produce zero matches.
     const emails = (idx.Items ?? []).map((i) => String(i.email));
     const profiles = await batchGetProfiles(emails);
-    return { items: profiles, next: idx.LastEvaluatedKey ? encodeCursor(idx.LastEvaluatedKey) : undefined };
+    const filtered = status ? profiles.filter((p) => p.status === status) : profiles;
+    return { items: filtered, next: idx.LastEvaluatedKey ? encodeCursor(idx.LastEvaluatedKey) : undefined };
   }
 
+  // Status filter is applied via FilterExpression so we don't pull every
+  // profile into memory just to throw most away. Note: DDB applies Limit
+  // BEFORE FilterExpression, so a page with mostly active contacts may yield
+  // fewer than `limit` matches when filtering for unsubscribed/bounced — the
+  // pagination cursor still advances correctly.
+  const expr: string[] = ['SK = :sk', 'begins_with(PK, :p)'];
+  const values: Record<string, unknown> = { ':sk': 'PROFILE', ':p': 'CONTACT#' };
+  const names: Record<string, string> = {};
+  if (status) {
+    expr.push('#s = :status');
+    values[':status'] = status;
+    names['#s'] = 'status';
+  }
   const scan = await ddb.send(
     new ScanCommand({
       TableName: TABLE,
-      FilterExpression: 'SK = :sk AND begins_with(PK, :p)',
-      ExpressionAttributeValues: { ':sk': 'PROFILE', ':p': 'CONTACT#' },
+      FilterExpression: expr.join(' AND '),
+      ExpressionAttributeValues: values,
+      ExpressionAttributeNames: Object.keys(names).length ? names : undefined,
       Limit: limit,
       ExclusiveStartKey: next ? decodeCursor(next) : undefined,
     }),

@@ -12,10 +12,15 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as AppRouteImport } from './routes/_app'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AuthCallbackRouteImport } from './routes/auth.callback'
+import { Route as AppTypesRouteImport } from './routes/_app.types'
 import { Route as AppSubscribersRouteImport } from './routes/_app.subscribers'
+import { Route as AppSettingsRouteImport } from './routes/_app.settings'
 import { Route as AppSendRouteImport } from './routes/_app.send'
 import { Route as AppHistoryRouteImport } from './routes/_app.history'
+import { Route as AppHelpRouteImport } from './routes/_app.help'
 import { Route as AppComposeRouteImport } from './routes/_app.compose'
+import { Route as AppTypesTypeIdRouteImport } from './routes/_app.types.$typeId'
+import { Route as AppHistoryCampaignIdRouteImport } from './routes/_app.history.$campaignId'
 
 const AppRoute = AppRouteImport.update({
   id: '/_app',
@@ -31,9 +36,19 @@ const AuthCallbackRoute = AuthCallbackRouteImport.update({
   path: '/auth/callback',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AppTypesRoute = AppTypesRouteImport.update({
+  id: '/types',
+  path: '/types',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppSubscribersRoute = AppSubscribersRouteImport.update({
   id: '/subscribers',
   path: '/subscribers',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsRoute = AppSettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
   getParentRoute: () => AppRoute,
 } as any)
 const AppSendRoute = AppSendRouteImport.update({
@@ -46,64 +61,109 @@ const AppHistoryRoute = AppHistoryRouteImport.update({
   path: '/history',
   getParentRoute: () => AppRoute,
 } as any)
+const AppHelpRoute = AppHelpRouteImport.update({
+  id: '/help',
+  path: '/help',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppComposeRoute = AppComposeRouteImport.update({
   id: '/compose',
   path: '/compose',
   getParentRoute: () => AppRoute,
 } as any)
+const AppTypesTypeIdRoute = AppTypesTypeIdRouteImport.update({
+  id: '/$typeId',
+  path: '/$typeId',
+  getParentRoute: () => AppTypesRoute,
+} as any)
+const AppHistoryCampaignIdRoute = AppHistoryCampaignIdRouteImport.update({
+  id: '/$campaignId',
+  path: '/$campaignId',
+  getParentRoute: () => AppHistoryRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/compose': typeof AppComposeRoute
-  '/history': typeof AppHistoryRoute
+  '/help': typeof AppHelpRoute
+  '/history': typeof AppHistoryRouteWithChildren
   '/send': typeof AppSendRoute
+  '/settings': typeof AppSettingsRoute
   '/subscribers': typeof AppSubscribersRoute
+  '/types': typeof AppTypesRouteWithChildren
   '/auth/callback': typeof AuthCallbackRoute
+  '/history/$campaignId': typeof AppHistoryCampaignIdRoute
+  '/types/$typeId': typeof AppTypesTypeIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/compose': typeof AppComposeRoute
-  '/history': typeof AppHistoryRoute
+  '/help': typeof AppHelpRoute
+  '/history': typeof AppHistoryRouteWithChildren
   '/send': typeof AppSendRoute
+  '/settings': typeof AppSettingsRoute
   '/subscribers': typeof AppSubscribersRoute
+  '/types': typeof AppTypesRouteWithChildren
   '/auth/callback': typeof AuthCallbackRoute
+  '/history/$campaignId': typeof AppHistoryCampaignIdRoute
+  '/types/$typeId': typeof AppTypesTypeIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/_app': typeof AppRouteWithChildren
   '/_app/compose': typeof AppComposeRoute
-  '/_app/history': typeof AppHistoryRoute
+  '/_app/help': typeof AppHelpRoute
+  '/_app/history': typeof AppHistoryRouteWithChildren
   '/_app/send': typeof AppSendRoute
+  '/_app/settings': typeof AppSettingsRoute
   '/_app/subscribers': typeof AppSubscribersRoute
+  '/_app/types': typeof AppTypesRouteWithChildren
   '/auth/callback': typeof AuthCallbackRoute
+  '/_app/history/$campaignId': typeof AppHistoryCampaignIdRoute
+  '/_app/types/$typeId': typeof AppTypesTypeIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
     | '/compose'
+    | '/help'
     | '/history'
     | '/send'
+    | '/settings'
     | '/subscribers'
+    | '/types'
     | '/auth/callback'
+    | '/history/$campaignId'
+    | '/types/$typeId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/compose'
+    | '/help'
     | '/history'
     | '/send'
+    | '/settings'
     | '/subscribers'
+    | '/types'
     | '/auth/callback'
+    | '/history/$campaignId'
+    | '/types/$typeId'
   id:
     | '__root__'
     | '/'
     | '/_app'
     | '/_app/compose'
+    | '/_app/help'
     | '/_app/history'
     | '/_app/send'
+    | '/_app/settings'
     | '/_app/subscribers'
+    | '/_app/types'
     | '/auth/callback'
+    | '/_app/history/$campaignId'
+    | '/_app/types/$typeId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -135,11 +195,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthCallbackRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/_app/types': {
+      id: '/_app/types'
+      path: '/types'
+      fullPath: '/types'
+      preLoaderRoute: typeof AppTypesRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/subscribers': {
       id: '/_app/subscribers'
       path: '/subscribers'
       fullPath: '/subscribers'
       preLoaderRoute: typeof AppSubscribersRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings': {
+      id: '/_app/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof AppSettingsRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/send': {
@@ -156,6 +230,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppHistoryRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/help': {
+      id: '/_app/help'
+      path: '/help'
+      fullPath: '/help'
+      preLoaderRoute: typeof AppHelpRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/compose': {
       id: '/_app/compose'
       path: '/compose'
@@ -163,21 +244,65 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppComposeRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/types/$typeId': {
+      id: '/_app/types/$typeId'
+      path: '/$typeId'
+      fullPath: '/types/$typeId'
+      preLoaderRoute: typeof AppTypesTypeIdRouteImport
+      parentRoute: typeof AppTypesRoute
+    }
+    '/_app/history/$campaignId': {
+      id: '/_app/history/$campaignId'
+      path: '/$campaignId'
+      fullPath: '/history/$campaignId'
+      preLoaderRoute: typeof AppHistoryCampaignIdRouteImport
+      parentRoute: typeof AppHistoryRoute
+    }
   }
 }
 
+interface AppHistoryRouteChildren {
+  AppHistoryCampaignIdRoute: typeof AppHistoryCampaignIdRoute
+}
+
+const AppHistoryRouteChildren: AppHistoryRouteChildren = {
+  AppHistoryCampaignIdRoute: AppHistoryCampaignIdRoute,
+}
+
+const AppHistoryRouteWithChildren = AppHistoryRoute._addFileChildren(
+  AppHistoryRouteChildren,
+)
+
+interface AppTypesRouteChildren {
+  AppTypesTypeIdRoute: typeof AppTypesTypeIdRoute
+}
+
+const AppTypesRouteChildren: AppTypesRouteChildren = {
+  AppTypesTypeIdRoute: AppTypesTypeIdRoute,
+}
+
+const AppTypesRouteWithChildren = AppTypesRoute._addFileChildren(
+  AppTypesRouteChildren,
+)
+
 interface AppRouteChildren {
   AppComposeRoute: typeof AppComposeRoute
-  AppHistoryRoute: typeof AppHistoryRoute
+  AppHelpRoute: typeof AppHelpRoute
+  AppHistoryRoute: typeof AppHistoryRouteWithChildren
   AppSendRoute: typeof AppSendRoute
+  AppSettingsRoute: typeof AppSettingsRoute
   AppSubscribersRoute: typeof AppSubscribersRoute
+  AppTypesRoute: typeof AppTypesRouteWithChildren
 }
 
 const AppRouteChildren: AppRouteChildren = {
   AppComposeRoute: AppComposeRoute,
-  AppHistoryRoute: AppHistoryRoute,
+  AppHelpRoute: AppHelpRoute,
+  AppHistoryRoute: AppHistoryRouteWithChildren,
   AppSendRoute: AppSendRoute,
+  AppSettingsRoute: AppSettingsRoute,
   AppSubscribersRoute: AppSubscribersRoute,
+  AppTypesRoute: AppTypesRouteWithChildren,
 }
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)

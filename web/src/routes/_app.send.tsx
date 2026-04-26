@@ -1,15 +1,20 @@
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   createCampaign,
+  getSettings,
   listTags,
   listTemplates,
+  listTypes,
   previewAudience,
   sendCampaign,
   type AudiencePreview,
+  type NewsletterType,
   type Template,
 } from '../api/endpoints';
+import { TypePill } from '../components/types/TypePill';
+import { renderFooterPreviewHtml } from '../lib/footerPreview';
 
 export const Route = createFileRoute('/_app/send')({
   component: SendPage,
@@ -35,6 +40,11 @@ function SendPage() {
     queryKey: ['templates'],
     queryFn: listTemplates,
   });
+  const { data: types = [] } = useQuery({
+    queryKey: ['types', false],
+    queryFn: () => listTypes(),
+  });
+  const typeById = useMemo(() => new Map(types.map((t) => [t.id, t])), [types]);
   const { data: tagsResp, isLoading: tagsLoading } = useQuery({
     queryKey: ['admin-tags'],
     queryFn: listTags,
@@ -43,15 +53,41 @@ function SendPage() {
     () => (tagsResp?.items ?? []).map((t) => t.tag),
     [tagsResp],
   );
+  const { data: settings } = useQuery({
+    queryKey: ['settings'],
+    queryFn: getSettings,
+    staleTime: 60_000,
+  });
 
   const [templateId, setTemplateId] = useState<string>('');
   const [campaignName, setCampaignName] = useState('');
   const [step, setStep] = useState<Step>(1);
+  const [previewOpen, setPreviewOpen] = useState(false);
+
+  // Compose page sets this when the user clicks "Continue to Send" so we land
+  // straight in the wizard with the right template selected. Consume + clear
+  // exactly once, after templates have loaded so the id can be validated.
+  useEffect(() => {
+    if (templateId) return;
+    if (templates.length === 0) return;
+    const preselect = window.localStorage.getItem('dispatch.send.preselectTemplate');
+    if (!preselect) return;
+    window.localStorage.removeItem('dispatch.send.preselectTemplate');
+    const t = templates.find((x) => x.id === preselect);
+    if (t) {
+      setTemplateId(t.id);
+      setCampaignName(t.title);
+    }
+  }, [templates, templateId]);
 
   // Step 1
   const [tagMode, setTagMode] = useState<TagMode>('all');
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [excludeTags, setExcludeTags] = useState<string[]>([]);
+  // Tracks types whose defaultTags we've already seeded into selectedTags.
+  // Prevents reseeding after the user manually edits — if they cleared the
+  // tags on purpose, switching back to the same template shouldn't refill.
+  const seededTypesRef = useRef<Set<string>>(new Set());
 
   // Step 2
   const [when, setWhen] = useState<WhenMode>('now');
@@ -67,6 +103,20 @@ function SendPage() {
     () => templates.find((t) => t.id === templateId),
     [templates, templateId],
   );
+  const templateType = template?.typeId ? typeById.get(template.typeId) : undefined;
+
+  // Seed selectedTags from the type's defaultTags when the user first picks a
+  // template that has a type with defaults. Only fires once per type; clearing
+  // tags afterward and re-picking the same template does NOT re-seed.
+  useEffect(() => {
+    if (!templateType) return;
+    if (seededTypesRef.current.has(templateType.id)) return;
+    if (!templateType.defaultTags?.length) return;
+    if (selectedTags.length > 0) return; // user already has something
+    setSelectedTags(templateType.defaultTags);
+    seededTypesRef.current.add(templateType.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [templateType?.id]);
 
   // Live audience preview — re-runs whenever the filter changes. Debounced
   // 350ms so dragging through tag chips doesn't flood the API.
@@ -148,11 +198,15 @@ function SendPage() {
               }}
             >
               <option value="">— choose —</option>
-              {templates.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.title} (v{t.version})
-                </option>
-              ))}
+              {templates.map((t) => {
+                const ty = t.typeId ? typeById.get(t.typeId) : undefined;
+                const prefix = ty ? `[${ty.name}] ` : '';
+                return (
+                  <option key={t.id} value={t.id}>
+                    {prefix}{t.title} (v{t.version})
+                  </option>
+                );
+              })}
             </select>
           </div>
           <div>
@@ -174,12 +228,22 @@ function SendPage() {
       <div className="stack" style={{ gap: 24, maxWidth: 860 }}>
         <HeaderBanner
           template={template}
+          type={templateType}
           onChangeTemplate={() => {
             setTemplateId('');
             setStep(1);
           }}
           onEditContent={() => navigate({ to: '/compose' })}
+          onPreview={() => setPreviewOpen(true)}
         />
+
+        {previewOpen && template?.html && (
+          <PreviewModal
+            template={template}
+            settings={settings}
+            onClose={() => setPreviewOpen(false)}
+          />
+        )}
 
         <Stepper step={step} />
 
@@ -289,19 +353,26 @@ function SendPage() {
 
 function HeaderBanner({
   template,
+  type,
   onChangeTemplate,
   onEditContent,
+  onPreview,
 }: {
   template: Template | undefined;
+  type: NewsletterType | undefined;
   onChangeTemplate: () => void;
   onEditContent: () => void;
+  onPreview: () => void;
 }) {
   return (
     <div className="card" style={{ background: 'var(--paper-deep)' }}>
       <div className="card-body" style={{ padding: '14px 18px' }}>
         <div className="row items-center gap-md">
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div className="eyebrow">Sending</div>
+            <div className="row items-center gap-sm">
+              <div className="eyebrow">Sending</div>
+              <TypePill type={type} />
+            </div>
             <div className="serif" style={{ fontSize: 17, marginTop: 2 }}>
               {template?.title || 'Untitled'}
             </div>
@@ -310,12 +381,96 @@ function HeaderBanner({
               {template?.subject || <em className="faint">(no subject yet)</em>}
             </div>
           </div>
+          <button
+            className="btn btn-sm"
+            onClick={onPreview}
+            disabled={!template?.html}
+            title="Open the rendered email in a new tab"
+          >
+            Preview
+          </button>
           <button className="btn btn-sm" onClick={onChangeTemplate}>
             Change
           </button>
           <button className="btn btn-sm" onClick={onEditContent}>
             Edit content
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PreviewModal({
+  template,
+  settings,
+  onClose,
+}: {
+  template: Template;
+  settings: { footerHtml?: string; senderName?: string; senderAddress?: string } | undefined;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const footer = renderFooterPreviewHtml({
+    footerHtml: settings?.footerHtml ?? '',
+    senderName: settings?.senderName,
+    senderAddress: settings?.senderAddress,
+    unsubUrl: 'https://example.com/u?c=preview&e=you%40example.com&t=preview',
+  });
+  const doc = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  body { margin: 0; background: #f3f4f6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  .preview-shell { max-width: 640px; margin: 24px auto; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; }
+  .preview-body { padding: 24px; }
+</style>
+</head>
+<body>
+<div class="preview-shell"><div class="preview-body">${template.html}${footer}</div></div>
+</body>
+</html>`;
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal modal-lg"
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: '92vw', maxWidth: 1000, height: '90vh', display: 'flex', flexDirection: 'column' }}
+      >
+        <div className="modal-header">
+          <div className="eyebrow">Email preview</div>
+          <h2 className="serif" style={{ fontSize: 18, marginTop: 4 }}>
+            {template.subject || template.title || '(no subject)'}
+          </h2>
+          <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+            Unsubscribe link is a placeholder. The footer is appended automatically on real sends.
+          </p>
+        </div>
+        <div className="modal-body" style={{ flex: 1, padding: '8px 16px 16px' }}>
+          <iframe
+            title="email-preview"
+            srcDoc={doc}
+            style={{
+              width: '100%',
+              height: '100%',
+              border: '1px solid var(--rule)',
+              borderRadius: 6,
+              background: 'var(--paper)',
+            }}
+          />
+        </div>
+        <div className="modal-footer" style={{ justifyContent: 'flex-end' }}>
+          <button className="btn btn-sm" onClick={onClose}>Close</button>
         </div>
       </div>
     </div>

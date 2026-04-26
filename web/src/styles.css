@@ -165,9 +165,10 @@ h3 { font-size: 18px; line-height: 1.25; }
   background: transparent;
   text-align: left;
   font-family: var(--sans);
+  text-decoration: none;
   transition: background 0.12s, color 0.12s;
 }
-.nav-item:hover { background: var(--paper-deep); color: var(--ink); }
+.nav-item:hover { background: var(--paper-deep); color: var(--ink); text-decoration: none; }
 .nav-item.active {
   background: var(--ink);
   color: var(--paper);
@@ -368,6 +369,10 @@ h3 { font-size: 18px; line-height: 1.25; }
 .pill.scheduled .pill-dot { background: var(--warn); }
 .pill.draft { background: var(--paper-deep); color: var(--ink-mute); }
 .pill.draft .pill-dot { background: var(--ink-faint); }
+.pill.queued { background: oklch(0.95 0.04 145); color: oklch(0.38 0.09 145); border-color: oklch(0.85 0.05 145); }
+.pill.queued .pill-dot { background: var(--good); }
+.pill.failed { background: oklch(0.95 0.05 25); color: oklch(0.42 0.12 25); border-color: oklch(0.85 0.07 25); }
+.pill.failed .pill-dot { background: var(--bad); }
 
 /* Metric card */
 .metric {
@@ -667,6 +672,7 @@ h3 { font-size: 18px; line-height: 1.25; }
   border-radius: 6px;
   overflow: hidden;
   background: var(--paper);
+  flex-shrink: 0;
 }
 .segmented button {
   border: none;
@@ -677,6 +683,8 @@ h3 { font-size: 18px; line-height: 1.25; }
   color: var(--ink-soft);
   cursor: pointer;
   border-right: 1px solid var(--rule);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .segmented button:last-child { border-right: none; }
 .segmented button.active { background: var(--ink); color: var(--paper); }

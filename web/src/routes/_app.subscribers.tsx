@@ -6,20 +6,35 @@ import {
   deleteContact,
   getImport,
   listContacts,
+  listSuppressions,
   listTags,
+  patchContact,
+  removeSuppression,
+  upsertContact,
   uploadCsv,
+  type Contact,
+  type Suppression,
 } from '../api/endpoints';
 
 export const Route = createFileRoute('/_app/subscribers')({
   component: SubscribersPage,
 });
 
+type View = 'subscribers' | 'suppressions';
+
 function SubscribersPage() {
   const qc = useQueryClient();
+  const [view, setView] = useState<View>('subscribers');
   const [tagFilter, setTagFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'' | 'active' | 'unsubscribed' | 'bounced'>('');
   const { data, isLoading, error } = useQuery({
-    queryKey: ['contacts', tagFilter],
-    queryFn: () => listContacts(tagFilter ? { tag: tagFilter, limit: 200 } : { limit: 200 }),
+    queryKey: ['contacts', tagFilter, statusFilter],
+    queryFn: () =>
+      listContacts({
+        ...(tagFilter ? { tag: tagFilter } : {}),
+        ...(statusFilter ? { status: statusFilter } : {}),
+        limit: 200,
+      }),
   });
 
   // Tag universe for the upload modal's chip picker. Same source as the
@@ -34,6 +49,55 @@ function SubscribersPage() {
   const [uploading, setUploading] = useState(false);
   const [importId, setImportId] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string>('');
+  const [addOpen, setAddOpen] = useState(false);
+
+  const addMut = useMutation({
+    mutationFn: (input: { email: string; name: string; org?: string; tags: string[] }) =>
+      upsertContact(input),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['contacts'] });
+      qc.invalidateQueries({ queryKey: ['admin-tags'] });
+      setAddOpen(false);
+    },
+  });
+
+  // Suppression list (everyone the system will refuse to email — sourced from
+  // SES bounces, complaints, public-unsubscribe clicks, and manual additions).
+  const suppressionsQ = useQuery({
+    queryKey: ['suppressions'],
+    queryFn: listSuppressions,
+    enabled: view === 'suppressions',
+  });
+
+  const removeSuppMut = useMutation({
+    mutationFn: (email: string) => removeSuppression(email),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['suppressions'] }),
+  });
+
+  // Per-row tag edits — `variables.email` lets multiple in-flight edits coexist
+  // without one row's pending state masking another's. We optimistically patch
+  // the cached contact list so the pill update feels instant; on error we
+  // invalidate to fall back to the server state.
+  const tagsMut = useMutation({
+    mutationFn: ({ email, tags }: { email: string; tags: string[] }) =>
+      patchContact(email, { tags }),
+    onMutate: async ({ email, tags }) => {
+      await qc.cancelQueries({ queryKey: ['contacts'] });
+      const prev = qc.getQueriesData<{ items: Contact[]; next?: string }>({ queryKey: ['contacts'] });
+      qc.setQueriesData<{ items: Contact[]; next?: string }>({ queryKey: ['contacts'] }, (old) => {
+        if (!old) return old;
+        return { ...old, items: old.items.map((c) => (c.email === email ? { ...c, tags } : c)) };
+      });
+      return { prev };
+    },
+    onError: (_err, _vars, ctx) => {
+      ctx?.prev?.forEach(([key, value]) => qc.setQueryData(key, value));
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['contacts'] });
+      qc.invalidateQueries({ queryKey: ['admin-tags'] });
+    },
+  });
 
   const importQuery = useQuery({
     queryKey: ['import', importId],
@@ -85,34 +149,89 @@ function SubscribersPage() {
     <div className="stack" style={{ gap: 20 }}>
       <div className="card">
         <div className="card-header">
-          <div>
-            <div className="eyebrow">Audience</div>
-            <h3 className="serif mt-sm">Subscribers</h3>
+          <div className="row items-center gap-md">
+            <div>
+              <div className="eyebrow">Audience</div>
+              <h3 className="serif mt-sm">
+                {view === 'subscribers' ? 'Subscribers' : 'Suppression list'}
+              </h3>
+            </div>
+            <div className="segmented">
+              <button
+                className={view === 'subscribers' ? 'active' : ''}
+                onClick={() => setView('subscribers')}
+              >
+                Subscribers
+              </button>
+              <button
+                className={view === 'suppressions' ? 'active' : ''}
+                onClick={() => setView('suppressions')}
+              >
+                Suppression list
+              </button>
+            </div>
           </div>
-          <div className="row items-center gap-sm">
-            <select
-              className="select"
-              value={tagFilter}
-              onChange={(e) => setTagFilter(e.target.value)}
-              style={{ width: 220 }}
-              disabled={tagsLoading}
-            >
-              <option value="">All subscribers</option>
-              {knownTags.map((t) => (
-                <option key={t} value={t}>{t}</option>
-              ))}
-            </select>
-            <button
-              className="btn btn-accent btn-sm"
-              onClick={() => setUploadOpen(true)}
-              disabled={uploading}
-            >
-              Upload CSV
-            </button>
-          </div>
+          {view === 'subscribers' && (
+            <div className="row items-center gap-sm">
+              <select
+                className="select"
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value as typeof statusFilter)}
+                style={{ width: 160 }}
+                title="Filter by subscription status"
+              >
+                <option value="">All statuses</option>
+                <option value="active">Active</option>
+                <option value="unsubscribed">Unsubscribed</option>
+                <option value="bounced">Bounced</option>
+              </select>
+              <select
+                className="select"
+                value={tagFilter}
+                onChange={(e) => setTagFilter(e.target.value)}
+                style={{ width: 200 }}
+                disabled={tagsLoading}
+              >
+                <option value="">All tags</option>
+                {knownTags.map((t) => (
+                  <option key={t} value={t}>{t}</option>
+                ))}
+              </select>
+              <button
+                className="btn btn-sm"
+                onClick={() => setAddOpen(true)}
+              >
+                + Add subscriber
+              </button>
+              <button
+                className="btn btn-accent btn-sm"
+                onClick={() => setUploadOpen(true)}
+                disabled={uploading}
+              >
+                Upload CSV
+              </button>
+            </div>
+          )}
         </div>
         <div className="card-body">
-          {(uploadStatus || importQuery.data) && (
+          {view === 'suppressions' && (
+            <SuppressionsPanel
+              query={suppressionsQ}
+              onRemove={(email) => {
+                if (
+                  confirm(
+                    `Remove ${email} from the suppression list?\n\n` +
+                      `This will allow campaigns to send to this address again. ` +
+                      `Only do this if you've confirmed the bounce/unsubscribe was a mistake.`,
+                  )
+                ) {
+                  removeSuppMut.mutate(email);
+                }
+              }}
+              removingEmail={removeSuppMut.isPending ? removeSuppMut.variables : undefined}
+            />
+          )}
+          {view === 'subscribers' && (uploadStatus || importQuery.data) && (
             <div
               style={{
                 padding: 12,
@@ -142,15 +261,16 @@ function SubscribersPage() {
             </div>
           )}
 
-          {isLoading && <p className="muted">Loading subscribers…</p>}
-          {error && (
+          {view === 'subscribers' && isLoading && <p className="muted">Loading subscribers…</p>}
+          {view === 'subscribers' && error && (
             <p style={{ color: 'var(--bad)' }}>Failed to load contacts: {(error as Error).message}</p>
           )}
-          {data && (
+          {view === 'subscribers' && data && (
             <>
               <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
                 Showing {data.items.length} subscriber{data.items.length === 1 ? '' : 's'}
-                {tagFilter && ` with tag "${tagFilter}"`}
+                {statusFilter && ` · ${statusFilter}`}
+                {tagFilter && ` · tag "${tagFilter}"`}
               </div>
               <table className="table">
                 <thead>
@@ -170,18 +290,23 @@ function SubscribersPage() {
                       <td>{c.name}</td>
                       <td>{c.org ?? '—'}</td>
                       <td>
-                        {c.tags.length === 0 ? (
-                          <span className="faint" style={{ fontSize: 11 }}>—</span>
-                        ) : (
-                          c.tags.map((t) => (
-                            <span key={t} className="pill" style={{ marginRight: 4 }}>
-                              {t}
-                            </span>
-                          ))
-                        )}
+                        <TagsCell
+                          contact={c}
+                          knownTags={knownTags}
+                          onChange={(tags) => tagsMut.mutate({ email: c.email, tags })}
+                          pending={tagsMut.isPending && tagsMut.variables?.email === c.email}
+                        />
                       </td>
                       <td>
-                        <span className={`pill ${c.status === 'active' ? 'sent' : 'draft'}`}>
+                        <span
+                          className={`pill ${
+                            c.status === 'active'
+                              ? 'sent'
+                              : c.status === 'bounced'
+                                ? 'failed'
+                                : 'draft'
+                          }`}
+                        >
                           {c.status}
                         </span>
                       </td>
@@ -225,6 +350,488 @@ function SubscribersPage() {
           onUpload={onUpload}
         />
       )}
+
+      {addOpen && (
+        <AddSubscriberModal
+          knownTags={knownTags}
+          tagsLoading={tagsLoading}
+          submitting={addMut.isPending}
+          error={addMut.error as Error | undefined}
+          onClose={() => {
+            if (!addMut.isPending) {
+              setAddOpen(false);
+              addMut.reset();
+            }
+          }}
+          onSubmit={(input) => addMut.mutate(input)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Suppressions panel ─────────────────────────────────────────────────────
+
+function SuppressionsPanel({
+  query,
+  onRemove,
+  removingEmail,
+}: {
+  query: { isLoading: boolean; error: unknown; data?: { items: Suppression[] } };
+  onRemove: (email: string) => void;
+  removingEmail: string | undefined;
+}) {
+  if (query.isLoading) {
+    return <p className="muted">Loading suppression list…</p>;
+  }
+  if (query.error) {
+    return (
+      <p style={{ color: 'var(--bad)' }}>
+        Failed to load suppressions: {(query.error as Error).message}
+      </p>
+    );
+  }
+  const items = query.data?.items ?? [];
+  return (
+    <>
+      <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+        {items.length === 0
+          ? 'No suppressions on file. Bounces, complaints, and unsubscribes will appear here automatically.'
+          : `${items.length} address${items.length === 1 ? '' : 'es'} the system will refuse to send to.`}
+      </div>
+      {items.length > 0 && (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Email</th>
+              <th>Reason</th>
+              <th>Source</th>
+              <th>Added</th>
+              <th>Note</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((s) => (
+              <tr key={`${s.email}-${s.reason}`}>
+                <td className="mono-sm">{s.email}</td>
+                <td>
+                  <SuppressionReasonPill reason={s.reason} />
+                </td>
+                <td className="muted" style={{ fontSize: 12 }}>{s.source ?? '—'}</td>
+                <td className="muted mono-sm" style={{ fontSize: 11 }}>
+                  {s.addedAt ? new Date(s.addedAt).toLocaleString() : '—'}
+                </td>
+                <td className="muted" style={{ fontSize: 12 }}>
+                  {s.note || (s.addedBy ? <span className="faint">by {s.addedBy}</span> : '—')}
+                </td>
+                <td className="text-right">
+                  <button
+                    className="btn btn-sm btn-ghost"
+                    onClick={() => onRemove(s.email)}
+                    disabled={removingEmail === s.email}
+                    style={{ color: 'var(--bad)' }}
+                    title="Remove from suppression list"
+                  >
+                    {removingEmail === s.email ? 'Removing…' : 'Remove'}
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </>
+  );
+}
+
+function SuppressionReasonPill({ reason }: { reason: string }) {
+  const cls =
+    reason === 'bounce' ? 'failed' : reason === 'complaint' ? 'failed' : 'draft';
+  return <span className={`pill ${cls}`}>{reason}</span>;
+}
+
+// ── Inline tags editor ─────────────────────────────────────────────────────
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const TAG_NORMALIZE_RE = /[^a-z0-9-]/g;
+
+function normalizeTag(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(TAG_NORMALIZE_RE, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+/**
+ * In-cell tag editor. Pills are clickable to remove (× appears on hover); the
+ * "+" button opens a small popover anchored under the cell with unselected
+ * known tags + a custom-tag input. All mutations call back through `onChange`
+ * with the full new tag array so the parent can patch the contact in one shot.
+ */
+function TagsCell({
+  contact,
+  knownTags,
+  onChange,
+  pending,
+}: {
+  contact: Contact;
+  knownTags: string[];
+  onChange: (tags: string[]) => void;
+  pending: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState('');
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  // Close the popover on outside click. Esc handled inline on the input.
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    window.addEventListener('mousedown', onDoc);
+    return () => window.removeEventListener('mousedown', onDoc);
+  }, [open]);
+
+  const removeTag = (t: string) => onChange(contact.tags.filter((x) => x !== t));
+  const addTag = (raw: string) => {
+    const t = normalizeTag(raw);
+    if (!t || contact.tags.includes(t)) return;
+    onChange([...contact.tags, t]);
+    setDraft('');
+  };
+
+  const unselected = knownTags.filter((t) => !contact.tags.includes(t));
+
+  return (
+    <div ref={wrapRef} style={{ position: 'relative', display: 'flex', flexWrap: 'wrap', gap: 4, alignItems: 'center' }}>
+      {contact.tags.length === 0 && !open && (
+        <span className="faint" style={{ fontSize: 11 }}>—</span>
+      )}
+      {contact.tags.map((t) => (
+        <button
+          key={t}
+          onClick={() => removeTag(t)}
+          disabled={pending}
+          title="Click to remove"
+          className="pill"
+          style={{
+            cursor: pending ? 'wait' : 'pointer',
+            border: '1px solid var(--rule)',
+            background: 'var(--paper-deep)',
+            color: 'var(--ink-soft)',
+            fontFamily: 'var(--sans)',
+            fontSize: 11,
+          }}
+        >
+          {t} <span style={{ marginLeft: 2, opacity: 0.6 }}>×</span>
+        </button>
+      ))}
+      <button
+        onClick={() => setOpen((v) => !v)}
+        disabled={pending}
+        title="Add tag"
+        style={{
+          border: '1px dashed var(--rule)',
+          background: 'transparent',
+          color: 'var(--ink-mute)',
+          borderRadius: 99,
+          padding: '2px 8px',
+          fontSize: 11,
+          fontFamily: 'var(--sans)',
+          cursor: pending ? 'wait' : 'pointer',
+        }}
+      >
+        + Tag
+      </button>
+      {open && (
+        <div
+          style={{
+            position: 'absolute',
+            top: '100%',
+            left: 0,
+            marginTop: 4,
+            minWidth: 220,
+            maxWidth: 320,
+            zIndex: 10,
+            background: 'var(--paper)',
+            border: '1px solid var(--rule)',
+            borderRadius: 6,
+            boxShadow: '0 4px 12px oklch(0.15 0 0 / 0.08)',
+            padding: 10,
+          }}
+        >
+          {unselected.length > 0 && (
+            <div className="row items-center" style={{ gap: 4, flexWrap: 'wrap', marginBottom: 8 }}>
+              {unselected.map((t) => (
+                <button
+                  key={t}
+                  onClick={() => {
+                    addTag(t);
+                    setOpen(false);
+                  }}
+                  style={{
+                    background: 'var(--paper)',
+                    color: 'var(--ink-soft)',
+                    border: '1px solid var(--rule)',
+                    borderRadius: 99,
+                    padding: '3px 9px',
+                    fontSize: 11,
+                    fontFamily: 'var(--sans)',
+                    cursor: 'pointer',
+                  }}
+                >
+                  + {t}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="row items-center gap-sm">
+            <input
+              className="input"
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  addTag(draft);
+                  setOpen(false);
+                } else if (e.key === 'Escape') {
+                  setOpen(false);
+                }
+              }}
+              placeholder="New tag…"
+              style={{ flex: 1, fontSize: 12, padding: '5px 8px' }}
+            />
+            <button
+              className="btn btn-sm"
+              disabled={!draft.trim()}
+              onClick={() => {
+                addTag(draft);
+                setOpen(false);
+              }}
+            >
+              Add
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Add subscriber modal ───────────────────────────────────────────────────
+
+function AddSubscriberModal({
+  knownTags,
+  tagsLoading,
+  submitting,
+  error,
+  onClose,
+  onSubmit,
+}: {
+  knownTags: string[];
+  tagsLoading: boolean;
+  submitting: boolean;
+  error?: Error;
+  onClose: () => void;
+  onSubmit: (input: { email: string; name: string; org?: string; tags: string[] }) => void;
+}) {
+  const [email, setEmail] = useState('');
+  const [name, setName] = useState('');
+  const [org, setOrg] = useState('');
+  const [tags, setTags] = useState<string[]>([]);
+  const [draftTag, setDraftTag] = useState('');
+  const [emailError, setEmailError] = useState<string | null>(null);
+
+  // Esc to close — matches the rest of the app's modal behavior.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !submitting) onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [submitting, onClose]);
+
+  const toggleTag = (t: string) => {
+    setTags(tags.includes(t) ? tags.filter((x) => x !== t) : [...tags, t]);
+  };
+  const addCustomTag = () => {
+    const t = draftTag
+      .trim()
+      .toLowerCase()
+      .replace(TAG_NORMALIZE_RE, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
+    if (!t) return;
+    if (!tags.includes(t)) setTags([...tags, t]);
+    setDraftTag('');
+  };
+
+  const submit = () => {
+    const cleanEmail = email.trim().toLowerCase();
+    if (!EMAIL_RE.test(cleanEmail)) {
+      setEmailError('Enter a valid email address.');
+      return;
+    }
+    setEmailError(null);
+    onSubmit({
+      email: cleanEmail,
+      // Default the display name to the address's local part — matches what
+      // the CSV importer does when the name column is empty.
+      name: name.trim() || cleanEmail.split('@')[0],
+      org: org.trim() || undefined,
+      tags,
+    });
+  };
+
+  const unselected = knownTags.filter((t) => !tags.includes(t));
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 480 }}>
+        <div className="modal-header">
+          <div>
+            <div className="eyebrow">Audience</div>
+            <h3 className="serif mt-sm">Add subscriber</h3>
+          </div>
+        </div>
+        <div className="modal-body stack" style={{ gap: 14 }}>
+          <div>
+            <div className="label">Email</div>
+            <input
+              className="input"
+              type="email"
+              autoFocus
+              value={email}
+              onChange={(e) => {
+                setEmail(e.target.value);
+                if (emailError) setEmailError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') submit();
+              }}
+              placeholder="person@example.org"
+              style={{ fontFamily: 'var(--mono)', fontSize: 13, padding: '8px 10px' }}
+            />
+            {emailError && (
+              <div style={{ color: 'var(--bad)', fontSize: 11, marginTop: 4 }}>{emailError}</div>
+            )}
+          </div>
+          <div>
+            <div className="label">Name (optional)</div>
+            <input
+              className="input"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Defaults to the email's local part"
+              style={{ fontFamily: 'var(--serif)', fontSize: 14, padding: '8px 10px' }}
+            />
+          </div>
+          <div>
+            <div className="label">Organization (optional)</div>
+            <input
+              className="input"
+              value={org}
+              onChange={(e) => setOrg(e.target.value)}
+              style={{ fontSize: 13, padding: '8px 10px' }}
+            />
+          </div>
+          <div>
+            <div className="label">Tags</div>
+            <div className="stack" style={{ gap: 8 }}>
+              {tags.length > 0 && (
+                <div className="row items-center" style={{ gap: 6, flexWrap: 'wrap' }}>
+                  {tags.map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => toggleTag(t)}
+                      title="Click to remove"
+                      style={{
+                        background: 'var(--ink)',
+                        color: 'var(--paper)',
+                        border: 'none',
+                        borderRadius: 99,
+                        padding: '3px 9px',
+                        fontSize: 11,
+                        fontFamily: 'var(--sans)',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {t} ×
+                    </button>
+                  ))}
+                </div>
+              )}
+              {!tagsLoading && unselected.length > 0 && (
+                <div className="row items-center" style={{ gap: 6, flexWrap: 'wrap' }}>
+                  {unselected.map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => toggleTag(t)}
+                      style={{
+                        background: 'var(--paper)',
+                        color: 'var(--ink-soft)',
+                        border: '1px solid var(--rule)',
+                        borderRadius: 99,
+                        padding: '3px 9px',
+                        fontSize: 11,
+                        fontFamily: 'var(--sans)',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      + {t}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="row items-center gap-sm">
+                <input
+                  className="input"
+                  value={draftTag}
+                  onChange={(e) => setDraftTag(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      addCustomTag();
+                    }
+                  }}
+                  placeholder="Add custom tag…"
+                  style={{ flex: 1, fontSize: 12, padding: '6px 10px' }}
+                />
+                <button
+                  className="btn btn-sm"
+                  onClick={addCustomTag}
+                  disabled={!draftTag.trim()}
+                >
+                  Add
+                </button>
+              </div>
+            </div>
+          </div>
+          {error && (
+            <div style={{ color: 'var(--bad)', fontSize: 12 }}>
+              Failed to save: {error.message}
+            </div>
+          )}
+        </div>
+        <div className="modal-footer" style={{ justifyContent: 'flex-end', gap: 8 }}>
+          <button className="btn btn-sm" onClick={onClose} disabled={submitting}>
+            Cancel
+          </button>
+          <button
+            className="btn btn-sm btn-primary"
+            onClick={submit}
+            disabled={submitting || !email.trim()}
+          >
+            {submitting ? 'Saving…' : 'Save subscriber'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

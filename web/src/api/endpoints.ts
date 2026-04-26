@@ -21,9 +21,26 @@ export interface Template {
   subject: string;
   html: string;
   targetTags: string[];
+  /** Required server-side; optional in TS so partials still typecheck. */
+  typeId?: string;
   updatedAt: string;
   updatedBy?: string;
   deleted?: boolean;
+}
+
+export interface NewsletterType {
+  id: string;
+  name: string;
+  description?: string;
+  /** oklch hue 0..360 */
+  color: number;
+  defaultTags: string[];
+  defaultSubjectPrefix?: string;
+  /** Optional HTML body seeded into new newsletters created with this type. */
+  defaultBodyHtml?: string;
+  archived?: boolean;
+  createdAt: string;
+  createdBy?: string;
 }
 
 export type CampaignStatus = 'draft' | 'scheduled' | 'queued' | 'sending' | 'sent' | 'failed';
@@ -33,6 +50,8 @@ export interface Campaign {
   name: string;
   templateId?: string;
   templateVersion?: number;
+  /** Denormalized from the template at create time. */
+  typeId?: string;
   subject: string;
   html: string;
   status: CampaignStatus;
@@ -83,12 +102,32 @@ export const updateTemplate = (id: string, t: Partial<Template>) =>
   api<Template>(`/admin/templates/${id}`, { method: 'PUT', body: JSON.stringify(t) });
 export const deleteTemplate = (id: string) =>
   api<{ id: string; deleted: true }>(`/admin/templates/${id}`, { method: 'DELETE' });
+export const testSendTemplate = (id: string, to?: string) =>
+  api<{ id: string; to: string; enqueued: 1 }>(
+    `/admin/templates/${id}/test-send`,
+    { method: 'POST', body: JSON.stringify(to ? { to } : {}) },
+  );
+
+// ── Newsletter types ────────────────────────────────────────────────────────
+
+export const listTypes = (includeArchived = false) =>
+  api<NewsletterType[]>(`/admin/types${includeArchived ? '?includeArchived=1' : ''}`);
+export const getType = (id: string) => api<NewsletterType>(`/admin/types/${id}`);
+export const createType = (t: Partial<NewsletterType>) =>
+  api<NewsletterType>('/admin/types', { method: 'POST', body: JSON.stringify(t) });
+export const updateType = (id: string, t: Partial<NewsletterType>) =>
+  api<NewsletterType>(`/admin/types/${id}`, { method: 'PUT', body: JSON.stringify(t) });
+export const archiveType = (id: string) =>
+  api<{ id: string; archived: true }>(`/admin/types/${id}`, { method: 'DELETE' });
 
 // ── Contacts ────────────────────────────────────────────────────────────────
 
-export const listContacts = (opts: { tag?: string; limit?: number; next?: string } = {}) => {
+export const listContacts = (
+  opts: { tag?: string; status?: ContactStatus; limit?: number; next?: string } = {},
+) => {
   const qs = new URLSearchParams();
   if (opts.tag) qs.set('tag', opts.tag);
+  if (opts.status) qs.set('status', opts.status);
   if (opts.limit) qs.set('limit', String(opts.limit));
   if (opts.next) qs.set('next', opts.next);
   const s = qs.toString();
@@ -160,6 +199,28 @@ export const cancelScheduledCampaign = (id: string) =>
     { method: 'POST' },
   );
 
+export interface CampaignRecipient {
+  email: string;
+  state?: string;
+  queuedAt?: string;
+  deliveredAt?: string;
+  openedAt?: string;
+  clickedAt?: string;
+  lastClickUrl?: string;
+  bouncedAt?: string;
+  bounceType?: string;
+  complainedAt?: string;
+  rejectedAt?: string;
+  failedAt?: string;
+  lastDelayAt?: string;
+  messageId?: string;
+}
+
+export const listCampaignRecipients = (id: string) =>
+  api<{ items: CampaignRecipient[]; truncated: boolean }>(
+    `/admin/campaigns/${id}/recipients`,
+  );
+
 // ── Assets (newsletter images) ──────────────────────────────────────────────
 
 export interface Asset {
@@ -225,12 +286,34 @@ export const previewAudience = (input: {
     body: JSON.stringify(input),
   });
 
+// ── Settings (org-level singleton) ──────────────────────────────────────────
+
+export interface OrgSettings {
+  footerHtml: string;
+  senderName?: string;
+  senderAddress?: string;
+  updatedAt?: string;
+  updatedBy?: string;
+}
+
+export const getSettings = () => api<OrgSettings>('/admin/settings');
+export const updateSettings = (s: Partial<OrgSettings>) =>
+  api<OrgSettings>('/admin/settings', { method: 'PUT', body: JSON.stringify(s) });
+
 // ── Suppressions ────────────────────────────────────────────────────────────
 
+export interface Suppression {
+  email: string;
+  reason: string;
+  addedAt: string;
+  source?: string;
+  note?: string;
+  addedBy?: string;
+  messageId?: string;
+}
+
 export const listSuppressions = () =>
-  api<{ items: Array<{ email: string; reason: string; addedAt: string; source?: string }> }>(
-    '/admin/suppressions',
-  );
+  api<{ items: Suppression[] }>('/admin/suppressions');
 export const addSuppression = (input: { email: string; reason?: string; note?: string }) =>
   api<{ email: string; reason: string }>('/admin/suppressions', {
     method: 'POST',

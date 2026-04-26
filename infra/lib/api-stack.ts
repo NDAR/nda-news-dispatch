@@ -74,10 +74,12 @@ export class ApiStack extends Stack {
         ENV_NAME: config.envName,
         TABLE_NAME: table.tableName,
         ARCHIVE_BUCKET: archiveBucket.bucketName,
+        SEND_QUEUE_URL: sendQueue.queueUrl,
       },
     });
     table.grantReadWriteData(templatesFn);
     archiveBucket.grantPut(templatesFn, 'renders/*');
+    sendQueue.grantSendMessages(templatesFn);
 
     const contactsFn = new NodejsFunction(this, 'ContactsFn', {
       ...baseFnProps,
@@ -124,6 +126,32 @@ export class ApiStack extends Stack {
     // Scheduled-send wiring is appended below — the schedule group + role +
     // dispatch Lambda are created in the next block so we can't reference
     // them at construction time.
+
+    const typesFn = new NodejsFunction(this, 'TypesFn', {
+      ...baseFnProps,
+      entry: path.resolve(repoRoot, 'services/api-admin/src/types.ts'),
+      handler: 'handler',
+      memorySize: 256,
+      timeout: Duration.seconds(10),
+      environment: {
+        ENV_NAME: config.envName,
+        TABLE_NAME: table.tableName,
+      },
+    });
+    table.grantReadWriteData(typesFn);
+
+    const settingsFn = new NodejsFunction(this, 'SettingsFn', {
+      ...baseFnProps,
+      entry: path.resolve(repoRoot, 'services/api-admin/src/settings.ts'),
+      handler: 'handler',
+      memorySize: 256,
+      timeout: Duration.seconds(10),
+      environment: {
+        ENV_NAME: config.envName,
+        TABLE_NAME: table.tableName,
+      },
+    });
+    table.grantReadWriteData(settingsFn);
 
     const suppressionsFn = new NodejsFunction(this, 'SuppressionsFn', {
       ...baseFnProps,
@@ -282,6 +310,16 @@ export class ApiStack extends Stack {
     templateById.addMethod('GET', new LambdaIntegration(templatesFn), authOpts);
     templateById.addMethod('PUT', new LambdaIntegration(templatesFn), authOpts);
     templateById.addMethod('DELETE', new LambdaIntegration(templatesFn), authOpts);
+    const templateTestSend = templateById.addResource('test-send');
+    templateTestSend.addMethod('POST', new LambdaIntegration(templatesFn), authOpts);
+
+    const types = admin.addResource('types');
+    types.addMethod('GET', new LambdaIntegration(typesFn), authOpts);
+    types.addMethod('POST', new LambdaIntegration(typesFn), authOpts);
+    const typeById: IResource = types.addResource('{id}');
+    typeById.addMethod('GET', new LambdaIntegration(typesFn), authOpts);
+    typeById.addMethod('PUT', new LambdaIntegration(typesFn), authOpts);
+    typeById.addMethod('DELETE', new LambdaIntegration(typesFn), authOpts);
 
     const contacts = admin.addResource('contacts');
     contacts.addMethod('GET', new LambdaIntegration(contactsFn), authOpts);
@@ -309,6 +347,9 @@ export class ApiStack extends Stack {
     campaignById
       .addResource('cancel')
       .addMethod('POST', new LambdaIntegration(campaignsFn), authOpts);
+    campaignById
+      .addResource('recipients')
+      .addMethod('GET', new LambdaIntegration(campaignsFn), authOpts);
 
     const tags = admin.addResource('tags');
     tags.addMethod('GET', new LambdaIntegration(audienceFn), authOpts);
@@ -319,6 +360,10 @@ export class ApiStack extends Stack {
     assets.addMethod('GET', new LambdaIntegration(assetsFn), authOpts);
     assets.addMethod('POST', new LambdaIntegration(assetsFn), authOpts);
     assets.addResource('{id}').addMethod('DELETE', new LambdaIntegration(assetsFn), authOpts);
+
+    const settings = admin.addResource('settings');
+    settings.addMethod('GET', new LambdaIntegration(settingsFn), authOpts);
+    settings.addMethod('PUT', new LambdaIntegration(settingsFn), authOpts);
 
     const suppressions = admin.addResource('suppressions');
     suppressions.addMethod('GET', new LambdaIntegration(suppressionsFn), authOpts);

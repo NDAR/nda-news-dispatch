@@ -50,6 +50,8 @@ export const handler: APIGatewayProxyHandler = async (event) => {
         return ok(await createCampaign(parseBody(event), claimsOf(event)));
       case 'GET /admin/campaigns/{id}':
         return ok(await getCampaign(path(event, 'id')));
+      case 'GET /admin/campaigns/{id}/recipients':
+        return ok(await listCampaignRecipients(path(event, 'id')));
       case 'DELETE /admin/campaigns/{id}':
         return ok(await deleteCampaign(path(event, 'id')));
       case 'POST /admin/campaigns/{id}/send':
@@ -90,6 +92,9 @@ interface CampaignRecord {
   name: string;
   templateId?: string;
   templateVersion?: number;
+  /** Denormalized from the template at create time. Persists even if the
+   *  type is later renamed or archived so historical analytics stay stable. */
+  typeId?: string;
   subject: string;
   html: string;
   status: 'draft' | 'scheduled' | 'queued' | 'sending' | 'sent' | 'failed';
@@ -103,7 +108,9 @@ interface CampaignRecord {
   scheduleAt?: string;
 }
 
-async function listCampaigns(event: APIGatewayProxyEvent): Promise<{ items: CampaignRecord[] }> {
+async function listCampaigns(
+  event: APIGatewayProxyEvent,
+): Promise<{ items: (CampaignRecord & { stats?: Record<string, number> })[] }> {
   const status = event.queryStringParameters?.status;
   const pk = status ? `STATUS#${status}` : 'STATUS#draft';
   const res = await ddb.send(
@@ -116,7 +123,89 @@ async function listCampaigns(event: APIGatewayProxyEvent): Promise<{ items: Camp
       Limit: 100,
     }),
   );
-  return { items: (res.Items ?? []).map(stripKeys) as CampaignRecord[] };
+  const items = (res.Items ?? []).map(stripKeys) as CampaignRecord[];
+  const stats = await batchGetStats(items.map((c) => c.id));
+  return {
+    items: items.map((c) => ({ ...c, stats: stats.get(c.id) })),
+  };
+}
+
+async function batchGetStats(ids: string[]): Promise<Map<string, Record<string, number>>> {
+  const out = new Map<string, Record<string, number>>();
+  if (ids.length === 0) return out;
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100);
+    const res = await ddb.send(
+      new BatchGetCommand({
+        RequestItems: {
+          [TABLE]: {
+            Keys: chunk.map((id) => ({ PK: `CAMPAIGN#${id}`, SK: 'STATS' })),
+          },
+        },
+      }),
+    );
+    for (const item of res.Responses?.[TABLE] ?? []) {
+      const id = String(item.PK).replace(/^CAMPAIGN#/, '');
+      out.set(id, stripKeys(item) as Record<string, number>);
+    }
+  }
+  return out;
+}
+
+interface CampaignRecipient {
+  email: string;
+  state?: string;
+  queuedAt?: string;
+  deliveredAt?: string;
+  openedAt?: string;
+  clickedAt?: string;
+  lastClickUrl?: string;
+  bouncedAt?: string;
+  bounceType?: string;
+  complainedAt?: string;
+  rejectedAt?: string;
+  failedAt?: string;
+  lastDelayAt?: string;
+  messageId?: string;
+}
+
+const RECIPIENTS_CAP = 5000;
+
+/**
+ * Returns the per-recipient engagement rows for a campaign in a single
+ * response. Capped at RECIPIENTS_CAP to keep the call bounded; flag the
+ * truncation so the UI can warn. Used by the detail page to render the
+ * opens timeline, top-links table, and the CSV export — no other call site
+ * fans out per-recipient queries today.
+ */
+async function listCampaignRecipients(
+  id: string,
+): Promise<{ items: CampaignRecipient[]; truncated: boolean }> {
+  const items: CampaignRecipient[] = [];
+  let cursor: Record<string, unknown> | undefined;
+  let truncated = false;
+  do {
+    const res = await ddb.send(
+      new QueryCommand({
+        TableName: TABLE,
+        KeyConditionExpression: 'PK = :pk AND begins_with(SK, :sk)',
+        ExpressionAttributeValues: {
+          ':pk': `CAMPAIGN#${id}`,
+          ':sk': 'RCPT#',
+        },
+        ExclusiveStartKey: cursor,
+      }),
+    );
+    for (const it of res.Items ?? []) {
+      items.push(stripKeys(it) as CampaignRecipient);
+      if (items.length >= RECIPIENTS_CAP) {
+        truncated = true;
+        break;
+      }
+    }
+    cursor = truncated ? undefined : res.LastEvaluatedKey;
+  } while (cursor);
+  return { items, truncated };
 }
 
 async function getCampaign(id: string): Promise<CampaignRecord & { stats: Record<string, number> }> {
@@ -137,6 +226,7 @@ async function createCampaign(input: CampaignInput, claims: Claims): Promise<Cam
   let subject = (input.subject ?? '').trim();
   let html = input.html ?? '';
   let templateVersion: number | undefined;
+  let typeId: string | undefined;
 
   if (input.templateId) {
     const t = await ddb.send(
@@ -146,6 +236,7 @@ async function createCampaign(input: CampaignInput, claims: Claims): Promise<Cam
     subject = subject || String(t.Item.subject ?? '');
     html = html || String(t.Item.html ?? '');
     templateVersion = t.Item.version as number;
+    typeId = t.Item.typeId as string | undefined;
   }
 
   if (!subject) throw new HttpError(400, 'invalid-input', 'subject is required');
@@ -156,6 +247,7 @@ async function createCampaign(input: CampaignInput, claims: Claims): Promise<Cam
     name: (input.name ?? '').trim() || 'Untitled campaign',
     templateId: input.templateId,
     templateVersion,
+    typeId,
     subject,
     html,
     status: 'draft',

@@ -1,4 +1,4 @@
-import { createFileRoute } from '@tanstack/react-router';
+import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useEditor, EditorContent, type Editor } from '@tiptap/react';
@@ -10,11 +10,15 @@ import {
   createTemplate,
   deleteTemplate,
   listTemplates,
+  listTypes,
+  testSendTemplate,
   updateTemplate,
   type Asset,
+  type NewsletterType,
   type Template,
 } from '../api/endpoints';
 import { AssetPickerModal } from '../components/AssetPickerModal';
+import { TypePill } from '../components/types/TypePill';
 
 export const Route = createFileRoute('/_app/compose')({
   component: ComposePage,
@@ -32,8 +36,12 @@ const DEFAULT_HTML = `<!doctype html>
   <p>Start composing here.</p>
 </body></html>`;
 
+const SEND_PRESELECT_KEY = 'dispatch.send.preselectTemplate';
+const LAST_TYPE_KEY = 'dispatch.compose.lastType';
+
 function ComposePage() {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const { data: templates = [], isLoading, error } = useQuery({
     queryKey: ['templates'],
     queryFn: async () => {
@@ -42,6 +50,14 @@ function ComposePage() {
       return t;
     },
   });
+  const { data: types = [] } = useQuery({
+    queryKey: ['types', false],
+    queryFn: () => listTypes(),
+  });
+  const typeById = useMemo(() => new Map(types.map((t) => [t.id, t])), [types]);
+  // The "+ New newsletter" flow: pick a type first, then create. The picker
+  // pops over the sidebar; cancelling closes it without creating.
+  const [picking, setPicking] = useState<{ open: boolean }>({ open: false });
 
   const [currentId, setCurrentId] = useState<string | null>(null);
   const [listCollapsed, setListCollapsed] = useState<boolean>(() => {
@@ -95,16 +111,23 @@ function ComposePage() {
   // more). A refetch-after-POST often still reads the old index, so instead
   // we update the query cache directly with the record the API just returned.
   const createMut = useMutation({
-    mutationFn: () =>
-      createTemplate({
+    mutationFn: (typeId: string) => {
+      const t = typeById.get(typeId);
+      const subject = t?.defaultSubjectPrefix?.trim() ?? '';
+      const html = t?.defaultBodyHtml?.trim() ? t.defaultBodyHtml : DEFAULT_HTML;
+      return createTemplate({
         title: 'Untitled newsletter',
-        subject: '',
-        html: DEFAULT_HTML,
+        subject,
+        html,
         targetTags: [],
-      }),
+        typeId,
+      });
+    },
     onSuccess: (t) => {
       qc.setQueryData<Template[]>(['templates'], (old) => [t, ...(old ?? [])]);
       setCurrentId(t.id);
+      if (t.typeId) window.localStorage.setItem(LAST_TYPE_KEY, t.typeId);
+      setPicking({ open: false });
     },
     onError: (e) => {
       console.error('createTemplate failed', e);
@@ -157,6 +180,26 @@ function ComposePage() {
       );
     },
     onError: (e) => console.error('[compose] save failed', e),
+  });
+
+  // "Send to yourself" — flushes any pending edit (so the test reflects what
+  // the user is currently looking at, not the last autosave) before calling
+  // the test-send endpoint. Recipient defaults to the signed-in user's email
+  // server-side, so no input is needed here.
+  const testSendMut = useMutation({
+    mutationFn: async () => {
+      const c = currentRef.current;
+      if (!c?.id) throw new Error('No newsletter selected');
+      if (!localSubject.trim()) throw new Error('Add a subject line before sending a test');
+      if (!localHtml.trim()) throw new Error('Newsletter has no content');
+      const dirty =
+        localHtml !== c.html || localSubject !== c.subject || localTitle !== c.title;
+      if (dirty) {
+        await updateTemplate(c.id, { ...c, html: localHtml, subject: localSubject, title: localTitle });
+      }
+      return testSendTemplate(c.id);
+    },
+    onError: (e) => console.error('test-send failed', e),
   });
 
   const deleteMut = useMutation({
@@ -411,13 +454,28 @@ function ComposePage() {
                 className="btn btn-primary btn-sm"
                 style={{ width: '100%', marginTop: 10, justifyContent: 'center' }}
                 onClick={() => {
-                  console.log('[compose] + New newsletter clicked; firing mutate…');
-                  createMut.mutate();
+                  // No types yet → bounce to the management page so the user
+                  // creates one first. Required-typeId means createTemplate
+                  // would otherwise 400.
+                  if (types.length === 0) {
+                    navigate({ to: '/types' });
+                    return;
+                  }
+                  setPicking({ open: true });
                 }}
                 disabled={createMut.isPending}
               >
                 {createMut.isPending ? 'Creating…' : '+ New newsletter'}
               </button>
+              {picking.open && (
+                <NewTypePicker
+                  types={types}
+                  defaultTypeId={window.localStorage.getItem(LAST_TYPE_KEY) ?? types[0]?.id ?? ''}
+                  onPick={(typeId) => createMut.mutate(typeId)}
+                  onCancel={() => setPicking({ open: false })}
+                  pending={createMut.isPending}
+                />
+              )}
               {createMut.error && (
                 <div style={{ marginTop: 10, padding: 8, background: 'oklch(0.95 0.05 25)', color: 'var(--bad)', borderRadius: 4, fontSize: 12 }}>
                   {(createMut.error as Error).message}
@@ -454,8 +512,11 @@ function ComposePage() {
                     <div className="muted" style={{ fontSize: 11, marginTop: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {t.subject || '(no subject)'}
                     </div>
-                    <div className="muted" style={{ fontSize: 10, marginTop: 6, fontFamily: 'var(--mono)' }}>
-                      v{t.version} · {new Date(t.updatedAt).toLocaleDateString()}
+                    <div className="row items-center" style={{ gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+                      <TypePill type={t.typeId ? typeById.get(t.typeId) : undefined} />
+                      <span className="muted" style={{ fontSize: 10, fontFamily: 'var(--mono)' }}>
+                        v{t.version} · {new Date(t.updatedAt).toLocaleDateString()}
+                      </span>
                     </div>
                   </button>
                 );
@@ -469,14 +530,40 @@ function ComposePage() {
         <div className="stack" style={{ gap: 16 }}>
           <div className="card">
             <div className="card-body" style={{ padding: 16 }}>
-              <div style={{ marginBottom: 12 }}>
-                <div className="label">Newsletter title (internal)</div>
-                <input
-                  className="input"
-                  value={localTitle}
-                  onChange={(e) => setLocalTitle(e.target.value)}
-                  style={{ fontFamily: 'var(--serif)', fontSize: 16, padding: '10px 12px' }}
-                />
+              <div className="row gap-md" style={{ marginBottom: 12, alignItems: 'flex-end' }}>
+                <div style={{ flex: 1 }}>
+                  <div className="label">Newsletter title (internal)</div>
+                  <input
+                    className="input"
+                    value={localTitle}
+                    onChange={(e) => setLocalTitle(e.target.value)}
+                    style={{ fontFamily: 'var(--serif)', fontSize: 16, padding: '10px 12px' }}
+                  />
+                </div>
+                <div style={{ flex: '0 0 220px' }}>
+                  <div className="label">Type</div>
+                  <select
+                    className="select"
+                    value={current.typeId ?? ''}
+                    onChange={(e) => {
+                      const newTypeId = e.target.value;
+                      if (!newTypeId || newTypeId === current.typeId) return;
+                      // Persist via the existing autosave path so the change
+                      // flushes immediately. Don't rewrite subject here — that
+                      // would clobber user-edited content.
+                      updateMut.mutate({ typeId: newTypeId });
+                      window.localStorage.setItem(LAST_TYPE_KEY, newTypeId);
+                    }}
+                    style={{ fontSize: 13, padding: '10px 12px' }}
+                  >
+                    {!current.typeId && <option value="">— pick a type —</option>}
+                    {types.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
               <div>
                 <div className="label">Subject line</div>
@@ -489,6 +576,10 @@ function ComposePage() {
               </div>
             </div>
           </div>
+
+          <p className="muted" style={{ fontSize: 12, margin: '0 0 8px' }}>
+            A standard footer with your unsubscribe link is added automatically on send — you don't need to include one here. Edit it on the <a href="/settings" style={{ color: 'inherit', textDecoration: 'underline' }}>Settings</a> page.
+          </p>
 
           <div className="split" style={{ gridTemplateColumns: '1fr 1fr', gridTemplateRows: '1fr' }}>
             <div className="split-pane">
@@ -610,8 +701,36 @@ function ComposePage() {
               >
                 Delete
               </button>
+              <button
+                className="btn btn-sm"
+                onClick={() => testSendMut.mutate()}
+                disabled={testSendMut.isPending}
+                title="Email the current draft to yourself for review"
+              >
+                {testSendMut.isPending
+                  ? 'Sending…'
+                  : testSendMut.isSuccess
+                    ? `Sent to ${testSendMut.data?.to ?? 'you'} ✓`
+                    : 'Send to yourself'}
+              </button>
+              <button
+                className="btn btn-sm btn-primary"
+                onClick={() => {
+                  if (current.id) {
+                    window.localStorage.setItem(SEND_PRESELECT_KEY, current.id);
+                  }
+                  navigate({ to: '/send' });
+                }}
+              >
+                Continue to Send →
+              </button>
             </div>
           </div>
+          {testSendMut.error && (
+            <div style={{ color: 'var(--bad)', fontSize: 12, paddingTop: 4 }}>
+              Test send failed: {(testSendMut.error as Error).message}
+            </div>
+          )}
         </div>
       ) : (
         <div className="muted" style={{ padding: 40, textAlign: 'center' }}>
@@ -626,6 +745,64 @@ function ComposePage() {
       />
     )}
     </>
+  );
+}
+
+function NewTypePicker({
+  types,
+  defaultTypeId,
+  onPick,
+  onCancel,
+  pending,
+}: {
+  types: NewsletterType[];
+  defaultTypeId: string;
+  onPick: (typeId: string) => void;
+  onCancel: () => void;
+  pending: boolean;
+}) {
+  const [chosen, setChosen] = useState<string>(defaultTypeId || types[0]?.id || '');
+  return (
+    <div
+      style={{
+        marginTop: 10,
+        padding: 10,
+        background: 'var(--paper-deep)',
+        border: '1px solid var(--rule)',
+        borderRadius: 6,
+      }}
+    >
+      <div className="label" style={{ marginBottom: 6 }}>Newsletter type</div>
+      <div className="stack" style={{ gap: 4, marginBottom: 10 }}>
+        {types.map((t) => (
+          <label key={t.id} className="row items-center gap-sm" style={{ fontSize: 12, cursor: 'pointer' }}>
+            <input
+              type="radio"
+              name="new-type"
+              value={t.id}
+              checked={chosen === t.id}
+              onChange={() => setChosen(t.id)}
+            />
+            <TypePill type={t} />
+            <span className="muted" style={{ fontSize: 11 }}>
+              {t.description ?? ''}
+            </span>
+          </label>
+        ))}
+      </div>
+      <div className="row gap-sm" style={{ justifyContent: 'flex-end' }}>
+        <button className="btn btn-sm" onClick={onCancel} disabled={pending}>
+          Cancel
+        </button>
+        <button
+          className="btn btn-sm btn-primary"
+          onClick={() => chosen && onPick(chosen)}
+          disabled={pending || !chosen}
+        >
+          {pending ? 'Creating…' : 'Create'}
+        </button>
+      </div>
+    </div>
   );
 }
 
