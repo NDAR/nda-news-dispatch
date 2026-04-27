@@ -1,17 +1,40 @@
 # infra — AWS CDK
 
+CDK v2 (TypeScript). Eight stacks per env. Deploys to `us-east-1` by default,
+configurable via `-c region=…`.
+
 ## Stacks
 
-- `NdaDispatch-<env>-Auth` — Cognito User Pool + hosted UI domain + SPA client (auth code flow, PKCE, 12-char password policy, optional TOTP MFA).
-- `NdaDispatch-<env>-Storage` — S3 buckets: `spa` (SPA assets) and `archive` (rendered HTML + previews).
-- `NdaDispatch-<env>-Edge` — CloudFront distribution + ACM cert for the configured `domain`. Single origin fronting: `/` → SPA bucket, `/archive/*` + `/renders/*` → archive bucket, `/admin/*` + `/public/*` → API Gateway. Cert uses DNS validation (no Route 53 dependency).
-- `NdaDispatch-<env>-Data` — DynamoDB single table (`nda-dispatch-<env>`) with GSI1, streams, PITR, TTL; SQS `import` and `send` queues (+ DLQs). See `docs/data-model.md`.
-- `NdaDispatch-<env>-Processing` — S3 `imports/*.csv` PUT → SQS `import` → `worker-import` Lambda. Parses CSV (quote-aware), checks suppressions, upserts contacts + tag index items, updates the `IMPORT#<id>` record with counts and status.
-- `NdaDispatch-<env>-Delivery` — SES domain identity `dispatch.scienthouse.io` (DKIM on, custom MAIL-FROM `mail.dispatch.scienthouse.io`), configuration set with reputation metrics + event destination → SNS topic `ses-events`. `worker-send` Lambda consumes SQS `send`, calls `SESv2:SendEmail` with List-Unsubscribe headers + per-recipient HMAC tokens, updates `RCPT#<email>` rows. Domain identity stays "pending verification" until DNS is wired (DKIM CNAMEs + `_amazonses` TXT).
-- `NdaDispatch-<env>-Events` — SNS `ses-events` → `worker-events` Lambda → Dynamo. Dispatches Send/Delivery/Bounce/Complaint/Open/Click/Reject/DeliveryDelay/RenderingFailure/Subscription into `STATS` ADD counters + `RCPT#<email>` timestamps + state. Permanent bounces and complaints write a `SUPP#<email>` suppression. Failures land in a dedicated `events-dlq`.
-- `NdaDispatch-<env>-Api` — Regional API Gateway REST API fronted by AWSv2 WAF (Common + KnownBadInputs managed rule groups, IP rate-limit scoped to `/public/*`). Routes:
-  - Admin (Cognito JWT required): `GET /admin/ping`, `GET|POST /admin/templates` + `{id}`, `GET|POST /admin/contacts` + `{email}`, `GET|POST /admin/imports` + `{id}`, `GET|POST /admin/campaigns` + `{id}` + `{id}/send`, `GET|POST /admin/suppressions` + `{email}`.
-  - Public (unauthenticated): `GET|POST /public/u` — HMAC-signed unsubscribe; GET returns a styled confirmation page, POST fulfills RFC 8058 one-click unsubscribe.
+| Stack | Purpose |
+|---|---|
+| `NdaDispatch-<env>-Auth` | Cognito User Pool + Hosted UI domain + SPA app client (auth code flow + PKCE, 12-char password policy, optional TOTP MFA). |
+| `NdaDispatch-<env>-Storage` | S3 buckets: `spa` (static SPA bundle), `archive` (rendered HTML + uploaded asset images). |
+| `NdaDispatch-<env>-Data` | DynamoDB single table (`nda-dispatch-<env>`) with GSI1 + GSI2, streams, PITR, TTL. SQS `send` queue (per-recipient SES jobs) + DLQ. SQS `enqueue` queue (one-message-per-campaign fan-out trigger) + DLQ. `unsubscribeSecret` in Secrets Manager (HMAC key for unsubscribe + view-in-browser tokens). |
+| `NdaDispatch-<env>-Processing` | S3 `imports/*.csv` PUT → SQS `import` → `worker-import` Lambda. Parses CSV (quote-aware), checks suppressions, upserts contacts + tag index items, updates the `IMPORT#<id>` record with counts and status. |
+| `NdaDispatch-<env>-Delivery` | SES domain identity (DKIM on, custom MAIL-FROM `mail.<domain>`), configuration set with reputation metrics + event destination → SNS `ses-events`. **`worker-send`** consumes the `send` SQS queue and calls `SESv2:SendEmail` with `List-Unsubscribe` headers + per-recipient HMAC tokens, prepends a "View in browser" bar, and re-uses module-cached campaign META + org settings. **`worker-enqueue`** (15-min timeout, batchSize 1) consumes the `enqueue` queue: materializes the audience, writes RCPT rows in 25-row DDB batches, and pushes per-recipient `{campaignId, email}` messages into the `send` queue. Domain identity stays "pending verification" until DNS is wired (DKIM CNAMEs + `_amazonses` TXT). |
+| `NdaDispatch-<env>-Events` | SNS `ses-events` → `worker-events` Lambda → DDB. Dispatches Send / Delivery / Bounce / Complaint / Open / Click / Reject / DeliveryDelay / RenderingFailure / Subscription into the `STATS` row (`ADD` counters), the `RCPT#<email>` row (timestamps + state + `clickedLinks` String Set), and per-link `LINK#<hash>` rows (`clicks` and `uniqueClicks` per URL). Permanent bounces and complaints write a `SUPP#<email>` suppression. Failures land in `events-dlq`. |
+| `NdaDispatch-<env>-Api` | Regional API Gateway REST API + AWS WAF v2 (Common + KnownBadInputs managed rules, IP rate-limit scoped to `/public/*`). Authentication via Cognito JWT authorizer for everything under `/admin/*`. |
+| `NdaDispatch-<env>-Edge` | CloudFront distribution + ACM cert (DNS-validated) for the configured `domain`. Single origin fronting `/` → SPA bucket, `/archive/*` + `/renders/*` → archive bucket, `/admin/*` + `/public/*` → API Gateway. |
+
+### API routes (defined in `lib/api-stack.ts`)
+
+**Admin (Cognito JWT required):**
+
+- `GET /admin/ping`
+- `GET|POST /admin/templates`, `GET|PUT|DELETE /admin/templates/{id}`, `POST /admin/templates/{id}/test-send`
+- `GET|POST /admin/types`, `GET|PUT|DELETE /admin/types/{id}`
+- `GET|POST /admin/contacts`, `GET|PATCH|DELETE /admin/contacts/{email}`
+- `GET|POST /admin/imports`, `GET /admin/imports/{id}`
+- `GET|POST /admin/campaigns`, `GET|DELETE /admin/campaigns/{id}`, `POST /admin/campaigns/{id}/send`, `POST /admin/campaigns/{id}/cancel`, `GET /admin/campaigns/{id}/recipients`, `GET /admin/campaigns/{id}/links`
+- `GET /admin/tags`, `POST /admin/audience/preview`
+- `GET|POST /admin/assets`, `DELETE /admin/assets/{id}`
+- `GET|PUT /admin/settings` (org-level footer, sender name, sender address)
+- `GET|POST /admin/suppressions`, `DELETE /admin/suppressions/{email}`
+
+**Public (unauthenticated):**
+
+- `GET|POST /public/u` — HMAC-signed unsubscribe (`UnsubscribeFn`). GET returns a confirmation page; POST fulfills RFC 8058 one-click unsubscribe.
+- `GET /public/v` — HMAC-signed view-in-browser (`ViewFn`). Re-renders the campaign HTML body + footer at view time using current org settings; no per-campaign rendered-HTML snapshot.
 
 ## One-time
 
@@ -30,9 +53,9 @@ context at deploy time, in this order of precedence:
 2. `cdk.json` context keys `domain.dev` / `domain.prod` (per-env) or bare `domain`
 3. Env var `DISPATCH_DOMAIN`
 
-The repo commits `domain.dev` + `domain.prod` in `infra/cdk.json` so routine
-deploys don't need any flags. Change that file (or pass `-c domain=…`) to
-point at a different hostname — no code change needed.
+`infra/cdk.json` ships with `domain.dev` + `domain.prod` so routine deploys
+need no flags. Change that file (or pass `-c domain=…`) to deploy to a
+different hostname — no code change needed.
 
 Other optional context keys: `rootDomain` (inferred from `domain` if unset),
 `region` (default `us-east-1`), `mailFromSubdomain` (default `mail`, yielding
@@ -40,155 +63,97 @@ Other optional context keys: `rootDomain` (inferred from `domain` if unset),
 
 ## Deploy
 
-**Run these from `infra/`** (so `cdk.json` is picked up):
+Prefer the **repo-root `./deploy.sh`** — it ships infra + SPA in one shot
+and supports `--infra-only` / `--web-only` / `--stacks` flags. See the
+top-level README for the full list.
+
+For raw CDK invocations, run from `infra/`:
 
 ```bash
 cd infra
 npm run synth
-npm run deploy:dev   # uses context domain.dev
-npm run deploy:prod  # uses context domain.prod
+npm run deploy:dev   # uses context domain.dev, --require-approval never
+npm run deploy:prod  # uses context domain.prod, --require-approval broadening
+
+# Single stack:
+npx cdk deploy NdaDispatch-Dev-Delivery -c env=dev
 
 # Ad-hoc override without touching cdk.json:
 npx cdk deploy --all -c env=dev -c domain=staging.example.com
 ```
 
-Or from the repo root, use the `--prefix` passthrough:
+If you see `--app is required either in command-line, in cdk.json or in
+~/.cdk.json`, you're running `cdk` from a directory that has no `cdk.json` —
+`cd infra` first or use the root-level scripts.
 
-```bash
-npm run deploy:dev   # same as above
-```
-
-If you see `--app is required either in command-line, in cdk.json or in ~/.cdk.json`,
-you're running `cdk` from a directory that has no `cdk.json` — `cd infra` first, or
-use the root-level npm scripts above.
-
-Outputs printed after a successful deploy:
-
-- `UserPoolId`, `UserPoolClientId`, `HostedUiDomain`, `Issuer`
-- `ApiUrl`
+Outputs printed after a successful deploy include `UserPoolId`,
+`UserPoolClientId`, `HostedUiDomain`, `Issuer`, `ApiUrl`, `SpaBucketName`,
+`DistributionId`, `DistributionDomain`, `SendQueueUrl`, `EnqueueQueueUrl`,
+`UnsubscribeSecretArn`.
 
 ## Smoke test
-
-Create the first admin (no self-signup), set a password, then:
 
 ```bash
 TOKEN=$(aws cognito-idp admin-initiate-auth --user-pool-id <id> \
   --client-id <client> --auth-flow ADMIN_USER_PASSWORD_AUTH \
-  --auth-parameters USERNAME=you@nimh.nih.gov,PASSWORD='…' \
+  --auth-parameters USERNAME=you@example.com,PASSWORD='…' \
   --query 'AuthenticationResult.IdToken' --output text)
 
-curl -H "Authorization: $TOKEN" "$API_URL/admin/ping"
-# → { "ok": true, "env": "dev", "user": { "sub": "...", "email": "..." } }
-```
-
-## Uploading the SPA
-
-```bash
-aws s3 sync web/ s3://$(aws cloudformation describe-stacks \
-  --stack-name NdaDispatch-Dev-Storage \
-  --query 'Stacks[0].Outputs[?OutputKey==`SpaBucketName`].OutputValue' --output text)/ \
-  --delete
-aws cloudfront create-invalidation --distribution-id <DistributionId> --paths '/*'
-```
-
-Then open `https://<DistributionDomain>/` (output of the storage stack).
-
-## curl smoke test (templates)
-
-```bash
-ID_TOKEN=$(aws cognito-idp admin-initiate-auth --user-pool-id <pool> \
-  --client-id <client> --auth-flow ADMIN_USER_PASSWORD_AUTH \
-  --auth-parameters USERNAME=you@nimh.nih.gov,PASSWORD='…' \
-  --query 'AuthenticationResult.IdToken' --output text)
 API=$(aws cloudformation describe-stacks --stack-name NdaDispatch-Dev-Api \
   --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' --output text)
 
-# create
-curl -sS -X POST "$API/admin/templates" \
-  -H "Authorization: $ID_TOKEN" -H 'content-type: application/json' \
-  -d '{"title":"May dispatch","subject":"Hello","html":"<h1>Hi</h1>","targetTags":["researcher"]}'
-
-# list
-curl -sS -H "Authorization: $ID_TOKEN" "$API/admin/templates"
-
-# update (new version)
-curl -sS -X PUT "$API/admin/templates/<id>" \
-  -H "Authorization: $ID_TOKEN" -H 'content-type: application/json' \
-  -d '{"title":"May dispatch","subject":"Hello v2","html":"<h1>Hi v2</h1>"}'
+curl -H "Authorization: $TOKEN" "$API/admin/ping"
+# → { "ok": true, "env": "dev", "user": { "sub": "...", "email": "..." } }
 ```
 
-Rendered HTML is viewable at `https://<DistributionDomain>/renders/<id>/v<version>.html`.
+## SPA upload
 
-## curl smoke test (contacts + CSV import)
-
-```bash
-# single contact
-curl -sS -X POST "$API/admin/contacts" \
-  -H "Authorization: $ID_TOKEN" -H 'content-type: application/json' \
-  -d '{"email":"mira.okafor@chop.edu","name":"Mira Okafor","org":"CHOP","tags":["researcher"]}'
-
-# list by tag
-curl -sS -H "Authorization: $ID_TOKEN" "$API/admin/contacts?tag=researcher"
-
-# CSV import — request a presigned upload URL, PUT the CSV, poll for status
-CREATE=$(curl -sS -X POST "$API/admin/imports" \
-  -H "Authorization: $ID_TOKEN" -H 'content-type: application/json' \
-  -d '{"filename":"sample.csv","assignTag":"new"}')
-IMPORT_ID=$(echo "$CREATE" | jq -r .importId)
-UPLOAD=$(echo "$CREATE" | jq -r .uploadUrl)
-
-printf 'email,name,org\njay@brown.edu,Jay Rao,Brown\n' \
-  | curl -sS -X PUT -H 'content-type: text/csv' --data-binary @- "$UPLOAD"
-
-# worker fires on the S3 PUT — poll until status=done
-curl -sS -H "Authorization: $ID_TOKEN" "$API/admin/imports/$IMPORT_ID"
-```
-
-## curl smoke test (campaigns + send)
+The repo-root `./deploy.sh` covers this; for the manual flow:
 
 ```bash
-# create a campaign from a template
-CAMP=$(curl -sS -X POST "$API/admin/campaigns" \
-  -H "Authorization: $ID_TOKEN" -H 'content-type: application/json' \
-  -d '{"name":"Smoke test","templateId":"<template-id>"}')
-CAMP_ID=$(echo "$CAMP" | jq -r .id)
+SPA=$(aws cloudformation describe-stacks --stack-name NdaDispatch-Dev-Storage --region us-east-1 \
+  --query 'Stacks[0].Outputs[?OutputKey==`SpaBucketName`].OutputValue' --output text)
+DIST=$(aws cloudformation describe-stacks --stack-name NdaDispatch-Dev-Edge --region us-east-1 \
+  --query 'Stacks[0].Outputs[?OutputKey==`DistributionId`].OutputValue' --output text)
 
-# send to contacts tagged "researcher" but NOT "international"
-curl -sS -X POST "$API/admin/campaigns/$CAMP_ID/send" \
-  -H "Authorization: $ID_TOKEN" -H 'content-type: application/json' \
-  -d '{"tagMode":"all","tags":["researcher"],"excludeTags":["international"]}'
-
-# campaign row now status=queued; RCPT rows written; worker-send fires per message
-curl -sS -H "Authorization: $ID_TOKEN" "$API/admin/campaigns/$CAMP_ID"
+cd web && npm run build
+aws s3 sync dist/ "s3://$SPA/" --delete \
+  --cache-control 'public, max-age=31536000, immutable' --exclude index.html
+aws s3 cp dist/index.html "s3://$SPA/index.html" --cache-control 'no-cache, must-revalidate'
+aws cloudfront create-invalidation --distribution-id "$DIST" --paths '/index.html' '/'
 ```
 
 ## SES DNS records (needed to actually send)
 
 After the Delivery stack deploys, the SES console shows pending DKIM tokens
-under "Verified identities → dispatch.scienthouse.io". Publish these at the NIMHDA
-DNS once you're ready:
+under "Verified identities → `<sendingDomain>`". Publish at your DNS:
 
-- 3 × CNAME for DKIM: `<token>._domainkey.dispatch.scienthouse.io` → `<token>.dkim.amazonses.com`
-- 1 × TXT for SPF on the MAIL-FROM subdomain: `mail.dispatch.scienthouse.io` → `v=spf1 include:amazonses.com -all`
-- 1 × MX for MAIL-FROM: `mail.dispatch.scienthouse.io` → `10 feedback-smtp.us-east-1.amazonses.com`
-- 1 × TXT for DMARC: `_dmarc.dispatch.scienthouse.io` → `v=DMARC1; p=none`
-  (the `rua=mailto:…` reporting address is optional — add one later, e.g. via a free aggregator like dmarcian / Postmark, once you want aggregate reports)
+- 3 × CNAME for DKIM: `<token>._domainkey.<domain>` → `<token>.dkim.amazonses.com`
+- 1 × TXT for SPF on the MAIL-FROM subdomain: `mail.<domain>` → `v=spf1 include:amazonses.com -all`
+- 1 × MX for MAIL-FROM: `mail.<domain>` → `10 feedback-smtp.us-east-1.amazonses.com`
+- 1 × TXT for DMARC: `_dmarc.<domain>` → `v=DMARC1; p=none`
+  (`rua=mailto:…` aggregator reporting is optional)
 
-Until verification succeeds and SES production access is granted, sends will
-fail with `MessageRejected`. Workflow can still be exercised end-to-end by
-verifying individual test recipients in the SES sandbox.
+Until DNS verification succeeds and SES production access is granted, sends
+fail with `MessageRejected`. The architecture can still be exercised
+end-to-end by verifying individual test recipients in the SES sandbox.
 
-## Note on open/click tracking
+## Open / click tracking
 
-SES's Configuration Set handles open pixels and click redirects automatically.
-Links in outgoing HTML are rewritten to the SES tracking domain (default
-`r.us-east-1.awstrack.me`), and the resulting Open / Click events flow through
-SNS → `worker-events` → Dynamo, so we don't need our own `/public/o` or
-`/public/c` endpoints. Replace the tracking domain with `track.dispatch.scienthouse.io`
-once DNS is wired by setting `trackingOptions.customRedirectDomain` on the
-configuration set.
+SES's Configuration Set handles the open pixel and click redirects
+automatically. Links in outgoing HTML are rewritten to the SES tracking
+domain (default `r.us-east-1.awstrack.me`); the resulting Open / Click events
+flow through SNS → `worker-events` → DDB, so we don't run our own `/public/o`
+or `/public/c`. Replace the tracking domain with `track.<domain>` once DNS is
+wired by setting `trackingOptions.customRedirectDomain` on the configuration
+set.
 
-## Walkthrough: pointing dispatch.scienthouse.io at the stack
+`worker-events` deduplicates per recipient: it bumps `opened` (every event)
+and `uniqueOpened` (only on first open per recipient via a conditional
+`attribute_not_exists(openedAt)` update). Same pattern for clicks, plus a
+per-URL `LINK#<hash>` row keyed off a SHA-1 of the link.
+
+## Walkthrough: pointing the chosen domain at the stack
 
 The `EdgeStack` creates the ACM cert + CloudFront alias + path-based routing.
 It needs your DNS in two places.
@@ -200,14 +165,14 @@ cd infra
 npm run deploy:dev
 ```
 
-When it reaches the `*-Edge` stack, it creates the ACM certificate and then
-**blocks** on `CertificateValidation`. CloudFormation is waiting for you to
-publish one DNS record that proves you own the domain. The deploy will time
-out after ~90 minutes if you don't add it.
+When it reaches `*-Edge`, it creates the ACM certificate and **blocks** on
+`CertificateValidation`. CloudFormation is waiting for you to publish one DNS
+record proving you own the domain. The deploy times out after ~90 minutes if
+the record isn't added.
 
 ### 2. Grab the ACM validation CNAME
 
-In a second terminal, while the deploy is paused:
+In a second terminal while the deploy is paused:
 
 ```bash
 CERT_ARN=$(aws cloudformation describe-stack-resources \
@@ -219,52 +184,29 @@ aws acm describe-certificate --certificate-arn "$CERT_ARN" --region us-east-1 \
   --query 'Certificate.DomainValidationOptions[0].ResourceRecord'
 ```
 
-You'll see something like:
-```json
-{
-  "Name":  "_abc123.dispatch.scienthouse.io.",
-  "Type":  "CNAME",
-  "Value": "_xyz789.acm-validations.aws."
-}
-```
+Publish the returned `Name` → `Value` as a CNAME at your DNS provider. CDK
+resumes within ~2 minutes once the cert validates.
 
-Publish that as a CNAME at your DNS provider. Within ~2 min CloudFormation
-sees the validation succeed and the stack continues creating the CloudFront
-distribution.
-
-### 3. Wait for CloudFront to deploy (~5–10 min)
-
-Once the stack finishes, grab the distribution's target hostname:
+### 3. Wait for CloudFront (~5–10 min) then publish the alias CNAME
 
 ```bash
 aws cloudformation describe-stacks --stack-name NdaDispatch-Dev-Edge --region us-east-1 \
   --query 'Stacks[0].Outputs[?OutputKey==`DistributionDomain`].OutputValue' --output text
-# e.g. d1a2b3c4.cloudfront.net
+# e.g. d1a2b3c4xxxxxx.cloudfront.net
 ```
 
-### 4. Publish the alias CNAME
+At your DNS provider, add a CNAME for the chosen subdomain pointing at that
+CloudFront hostname.
 
-At your DNS provider for `scienthouse.io`, add:
-
-| Type  | Name       | Value                    | TTL |
-|-------|------------|--------------------------|-----|
-| CNAME | `dispatch` | `d1a2b3c4.cloudfront.net`| 300 |
-
-DNS propagation is usually instant; worst case 5 min.
-
-### 5. Verify
+### 4. Verify
 
 ```bash
-curl -sI https://dispatch.scienthouse.io/                    # → 200, SPA HTML
-curl -sI https://dispatch.scienthouse.io/admin/ping          # → 401 (auth required, proves API Gateway is behind CloudFront)
-curl -sI "https://dispatch.scienthouse.io/public/u?c=x&e=x@y.z&t=z"  # → 400 (invalid token, proves public route works)
+curl -sI https://<your-domain>/                           # 200, SPA HTML
+curl -sI https://<your-domain>/admin/ping                 # 401 — auth required, proves API GW is behind CloudFront
+curl -sI "https://<your-domain>/public/u?c=x&e=x@y.z&t=z" # 400 — invalid token, proves public route works
+curl -sI "https://<your-domain>/public/v?c=x&e=x@y.z&t=z" # 400/403 — same shape for view-in-browser
 ```
 
-Once this works, update Cognito's SPA client callback URL in the console (or
-update `lib/auth-stack.ts`) to `https://dispatch.scienthouse.io/auth/callback`
-and run `npm run deploy:dev` again.
-
-## Not yet wired (tracked for step 8)
-
-- SPA port to Vite + React + TanStack Router; views wired to the admin API
-- CI/CD (GitHub Actions → CDK deploy, SPA build → S3 + CloudFront invalidation)
+Once this works, ensure the Cognito SPA client callback URL (set in
+`lib/auth-stack.ts`) includes `https://<your-domain>/auth/callback` and
+re-deploy.

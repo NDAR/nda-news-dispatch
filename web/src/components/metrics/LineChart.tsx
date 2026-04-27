@@ -9,10 +9,9 @@ interface LineChartProps {
 }
 
 /**
- * Pure-SVG line + area chart. No chart library. Ported from the legacy
- * `web-legacy/ui.jsx` design so the new History detail page matches the
- * original look. Renders into a 720-wide viewBox with `preserveAspectRatio
- * none` so the SVG stretches to whatever width its container has.
+ * Pure-SVG line + area chart. No chart library. Renders into a 720-wide
+ * viewBox with `preserveAspectRatio none` so the SVG stretches to whatever
+ * width its container has.
  */
 export function LineChart({ data, height = 240, xUnit = 'h', color = 'var(--accent)' }: LineChartProps) {
   const width = 720;
