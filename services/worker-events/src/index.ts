@@ -3,9 +3,30 @@ import { createHash } from 'node:crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
   DynamoDBDocumentClient,
+  GetCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { applySuppression, contactStatusIndexFields, suppressionState } from '../../../packages/shared/src';
+
+/**
+ * Pre-delivery security gateways (Microsoft Defender Safe Links, Proofpoint
+ * URL Defense, Mimecast, Barracuda, Cisco Talos, etc.) crawl every link in
+ * an inbound email before it lands in the user's inbox. Their fetches fire
+ * SES Open and Click events that look identical to real engagement.
+ *
+ * Two cheap heuristics catch most of them:
+ *   1. SCANNER_WINDOW_MS — events that arrive within this many ms after
+ *      Delivery are almost certainly the gateway's pre-fetch sweep, not a
+ *      human reading mail. Real opens almost never happen in <30s.
+ *   2. SCANNER_UA_RE — Click events sometimes carry a user-agent that
+ *      identifies the security product directly. We drop those even if
+ *      they arrive outside the time window.
+ *
+ * When a heuristic matches we log the event for observability and return
+ * without touching stats / RCPT timestamps / per-link counters.
+ */
+const SCANNER_WINDOW_MS = 30_000;
+const SCANNER_UA_RE = /\b(MSOffice|Microsoft Office|Outlook-iOS|Mimecast|Proofpoint|Barracuda|FireEye|Cisco|Symantec|Talos|Defender|SafeLinks|Forcepoint|Trustwave|Sophos|Bitdefender|Zscaler|MailControl|MessageLabs|Avast|AVG|McAfee|Microsoft URL Reputation|HeadlessChrome|Wget|curl|Go-http-client|libwww|Java\/[0-9]|python-requests)\b/i;
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -62,6 +83,11 @@ async function processRecord(record: SNSEventRecord): Promise<void> {
       await setRcpt(campaignId, email, { state: 'delivered', deliveredAt: now() });
       break;
     case 'Open': {
+      // Drop pre-delivery scanner pings — see SCANNER_WINDOW_MS comment.
+      if (await isScannerEvent(campaignId, email, ses.open?.timestamp, ses.open?.userAgent)) {
+        console.log(JSON.stringify({ level: 'info', msg: 'scanner-open-skipped', campaignId, email }));
+        break;
+      }
       // `opened` counts every Open event (incl. multi-device, image-proxy
       // prefetches, scanner reloads). `uniqueOpened` counts the first event
       // per recipient. The conditional update on the RCPT row tells us
@@ -76,6 +102,10 @@ async function processRecord(record: SNSEventRecord): Promise<void> {
     }
     case 'Click': {
       const url = ses.click?.link ?? '';
+      if (await isScannerEvent(campaignId, email, ses.click?.timestamp, ses.click?.userAgent)) {
+        console.log(JSON.stringify({ level: 'info', msg: 'scanner-click-skipped', campaignId, email, url }));
+        break;
+      }
       const firstClick = await claimFirstTimestamp(campaignId, email, 'clickedAt');
       await bumpStats(campaignId, firstClick ? { clicked: 1, uniqueClicked: 1 } : { clicked: 1 });
       await setRcpt(campaignId, email, { lastClickUrl: url, lastClickedAt: now() });
@@ -319,8 +349,51 @@ interface SesEvent {
   delivery?: { recipients?: string[]; timestamp?: string };
   bounce?: { bounceType?: string; bouncedRecipients?: { emailAddress: string }[] };
   complaint?: { complainedRecipients?: { emailAddress: string }[] };
-  open?: { timestamp?: string };
-  click?: { timestamp?: string; link?: string };
+  open?: { timestamp?: string; userAgent?: string; ipAddress?: string };
+  click?: { timestamp?: string; link?: string; userAgent?: string; ipAddress?: string };
+}
+
+/**
+ * Returns true if the event looks like a security gateway pre-fetch.
+ *
+ * Two checks:
+ *   - userAgent matches a known scanner regex
+ *   - the event timestamp is within SCANNER_WINDOW_MS of when the recipient
+ *     row first saw a Delivery (or queuing) timestamp. We GetItem the RCPT
+ *     row each time; this is one extra read per Open/Click but the row is
+ *     small and DDB on-demand handles it fine for typical send volumes.
+ *
+ * Falls back to "not a scanner" if either side is unavailable (e.g. the
+ * RCPT row is missing — test sends, very stale events) so we never silently
+ * drop legitimate engagement.
+ */
+async function isScannerEvent(
+  campaignId: string,
+  email: string,
+  eventTimestamp: string | undefined,
+  userAgent: string | undefined,
+): Promise<boolean> {
+  if (userAgent && SCANNER_UA_RE.test(userAgent)) return true;
+  if (!eventTimestamp) return false;
+  const eventMs = Date.parse(eventTimestamp);
+  if (!Number.isFinite(eventMs)) return false;
+
+  const res = await ddb.send(
+    new GetCommand({
+      TableName: TABLE,
+      Key: { PK: `CAMPAIGN#${campaignId}`, SK: `RCPT#${email}` },
+      ProjectionExpression: 'deliveredAt, queuedAt',
+    }),
+  ).catch(() => null);
+  const baseline =
+    typeof res?.Item?.deliveredAt === 'string' ? res.Item.deliveredAt
+    : typeof res?.Item?.queuedAt === 'string' ? res.Item.queuedAt
+    : null;
+  if (!baseline) return false;
+  const baselineMs = Date.parse(baseline);
+  if (!Number.isFinite(baselineMs)) return false;
+  const delta = eventMs - baselineMs;
+  return delta >= 0 && delta < SCANNER_WINDOW_MS;
 }
 
 function readCampaignId(e: SesEvent): string | null {

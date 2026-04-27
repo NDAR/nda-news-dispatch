@@ -73,16 +73,31 @@ async function loadTypeName(typeId: string): Promise<string | undefined> {
 }
 
 /**
- * Public, unauthenticated endpoints for unsubscribe:
- *   GET  /public/u             — browser-click unsubscribe; per-type by default
- *   POST /public/u             — RFC 8058 one-click unsubscribe (per-type)
- *   POST /public/u?scope=all   — escalate from confirmation page to global
+ * Public, unauthenticated endpoints for unsubscribe.
+ *
+ * Two-step flow, by design — never write a SUPP row from a single GET or
+ * a bare POST. Enterprise mail-security gateways (Defender Safe Links,
+ * Proofpoint URL Defense, Mimecast, Barracuda, etc.) crawl every link
+ * in inbound mail BEFORE delivery; if either method auto-acted we'd be
+ * unsubscribing real subscribers without their action.
+ *
+ *   GET  /public/u                — render confirmation page with a form
+ *                                    that POSTs back with confirm=1.
+ *                                    Writes nothing.
+ *   POST /public/u                — bare POST (e.g. RFC 8058 one-click
+ *                                    triggered by a scanner): return 200 OK
+ *                                    with no body, write nothing.
+ *   POST /public/u?confirm=1      — explicit "Yes, unsubscribe me" submit
+ *                                    from the confirmation page. Writes the
+ *                                    SUPP row (per-type by default).
+ *   POST /public/u?confirm=1&scope=all — escalate to global suppression.
  */
 export const handler: APIGatewayProxyHandler = async (event) => {
   const qs = (event.queryStringParameters ?? {}) as Record<string, string | undefined>;
   const campaignId = qs.c ?? '';
   const email = (qs.e ?? '').toLowerCase();
   const token = qs.t ?? '';
+  const confirm = qs.confirm === '1';
   const scopeParam = (qs.scope ?? '').toLowerCase();
   const escalateGlobal = scopeParam === 'all' || scopeParam === 'global';
 
@@ -102,33 +117,55 @@ export const handler: APIGatewayProxyHandler = async (event) => {
     context = { campaignId };
   }
 
-  // If the operator clicks "Unsubscribe from all" on the confirmation page
-  // (or a partner integration POSTs ?scope=all), record both layers — global
-  // hard suppression plus, if there's a typeId, the per-type entry too so
-  // history is unambiguous.
-  const scope: 'global' | 'type' = escalateGlobal || !context.typeId ? 'global' : 'type';
+  const proposedScope: 'global' | 'type' = escalateGlobal || !context.typeId ? 'global' : 'type';
+  const isPost = event.httpMethod === 'POST';
 
+  // Bare one-click POST (no `confirm=1`) — almost certainly a scanner.
+  // RFC 8058 expects a 200 with no body; give it that, do nothing.
+  if (isPost && !confirm) {
+    console.log(JSON.stringify({
+      level: 'info',
+      msg: 'unsubscribe-suppressed-bare-post',
+      email,
+      campaignId,
+      ua: event.headers?.['User-Agent'] ?? event.headers?.['user-agent'] ?? '',
+    }));
+    return { statusCode: 200, headers: { 'content-type': 'text/plain' }, body: 'OK' };
+  }
+
+  // GET — show the confirmation page; write nothing.
+  if (!isPost) {
+    const settings = await loadSettings().catch(() => ({ footerHtml: '' } as OrgSettings));
+    return html(
+      200,
+      confirmationPromptPage({
+        email,
+        settings,
+        context,
+        scope: proposedScope,
+        token,
+      }),
+    );
+  }
+
+  // POST with confirm=1 — the user (or operator) actually clicked the
+  // confirmation button. Record the unsubscribe.
   try {
-    await recordUnsubscribe(context, email, scope);
+    await recordUnsubscribe(context, email, proposedScope);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(JSON.stringify({ level: 'error', msg: 'unsubscribe-failed', email, campaignId, err: msg }));
     return html(500, errorPage('Sorry — something went wrong. Try again, or reply to the email.'));
   }
 
-  if (event.httpMethod === 'POST' && !escalateGlobal) {
-    // RFC 8058 one-click — mail clients want a 200 with no body.
-    return { statusCode: 200, headers: { 'content-type': 'text/plain' }, body: 'OK' };
-  }
-
   const settings = await loadSettings().catch(() => ({ footerHtml: '' } as OrgSettings));
   return html(
     200,
-    confirmationPage({
+    confirmationDonePage({
       email,
       settings,
       context,
-      scope,
+      scope: proposedScope,
       token,
     }),
   );
@@ -198,7 +235,7 @@ function verifyToken(campaignId: string, email: string, token: string): boolean 
   return verifyUnsubscribeToken(UNSUB_SECRET, campaignId, email, token);
 }
 
-interface ConfirmationOpts {
+interface PageOpts {
   email: string;
   settings: OrgSettings;
   context: CampaignContext;
@@ -206,7 +243,58 @@ interface ConfirmationOpts {
   token: string;
 }
 
-function confirmationPage(opts: ConfirmationOpts): string {
+/** Pre-action page: shown on GET. Asks the user to confirm before writing. */
+function confirmationPromptPage(opts: PageOpts): string {
+  const footerLine = senderFooterLine(opts.settings);
+  const typeLabel = opts.context.typeName ? escapeHtml(opts.context.typeName) : 'this newsletter';
+  const brandLabel = opts.settings.senderName
+    ? escapeHtml(opts.settings.senderName)
+    : 'this sender';
+
+  const headline =
+    opts.scope === 'global'
+      ? `Unsubscribe from all ${brandLabel} emails?`
+      : `Unsubscribe from ${typeLabel}?`;
+
+  const detail =
+    opts.scope === 'global'
+      ? `Click the button below to remove <code>${escapeHtml(opts.email)}</code> from every newsletter.`
+      : `Click the button below to remove <code>${escapeHtml(opts.email)}</code> from <strong>${typeLabel}</strong>. Other newsletters from ${brandLabel} will keep arriving.`;
+
+  const baseAction =
+    `?c=${encodeURIComponent(opts.context.campaignId)}` +
+    `&e=${encodeURIComponent(opts.email)}` +
+    `&t=${encodeURIComponent(opts.token)}`;
+  const confirmAction = `${baseAction}&confirm=1`;
+  const escalateAction = `${baseAction}&confirm=1&scope=all`;
+
+  const escalateBlock =
+    opts.scope === 'type'
+      ? `
+        <form method="POST" action="${escapeHtml(escalateAction)}" class="escalate">
+          <p>Want to stop all emails from ${brandLabel}, not just ${typeLabel}?</p>
+          <button type="submit" class="link">Unsubscribe from everything</button>
+        </form>`
+      : '';
+
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Confirm unsubscribe</title>
+  ${PAGE_STYLE}
+  </head>
+  <body><div class="card">
+    <h1>${escapeHtml(headline)}</h1>
+    <p>${detail}</p>
+    <form method="POST" action="${escapeHtml(confirmAction)}" class="primary">
+      <button type="submit" class="btn">Yes, unsubscribe</button>
+    </form>
+    ${escalateBlock}
+    ${footerLine ? `<p class="muted">${footerLine}</p>` : ''}
+  </div></body></html>`;
+}
+
+/** Post-action page: shown after a confirmed POST has written the SUPP row. */
+function confirmationDonePage(opts: PageOpts): string {
   const footerLine = senderFooterLine(opts.settings);
   const typeLabel = opts.context.typeName ? escapeHtml(opts.context.typeName) : 'this newsletter';
   const brandLabel = opts.settings.senderName
@@ -223,12 +311,11 @@ function confirmationPage(opts: ConfirmationOpts): string {
       ? `<code>${escapeHtml(opts.email)}</code> will no longer receive any newsletters from us.`
       : `<code>${escapeHtml(opts.email)}</code> has been removed from <strong>${typeLabel}</strong>. Other newsletters you're subscribed to will keep arriving.`;
 
-  // Only show the escalate-to-global form when we just processed a per-type
-  // unsubscribe. After someone has globally opted out, the form is redundant.
-  const escalateAction =
+  const baseAction =
     `?c=${encodeURIComponent(opts.context.campaignId)}` +
     `&e=${encodeURIComponent(opts.email)}` +
-    `&t=${encodeURIComponent(opts.token)}&scope=all`;
+    `&t=${encodeURIComponent(opts.token)}`;
+  const escalateAction = `${baseAction}&confirm=1&scope=all`;
   const escalateBlock =
     opts.scope === 'type'
       ? `
@@ -241,19 +328,8 @@ function confirmationPage(opts: ConfirmationOpts): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Unsubscribed</title>
-  <style>
-    body{font-family:'Source Serif 4',Georgia,serif;background:#faf7f1;color:#2a2420;margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}
-    .card{max-width:520px;width:100%;background:#fff;border:1px solid #e6decf;border-radius:8px;padding:36px 32px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
-    h1{font-size:24px;margin:0 0 12px;letter-spacing:-.01em}
-    p{font-size:15px;line-height:1.6;color:#554a40;margin:8px 0}
-    code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#f4efe5;padding:2px 6px;border-radius:3px;font-size:13px}
-    strong{color:#2a2420}
-    .muted{color:#8a7f70;font-size:13px;margin-top:22px;border-top:1px solid #e6decf;padding-top:14px;white-space:pre-line}
-    form.escalate{margin-top:18px;padding-top:14px;border-top:1px solid #e6decf}
-    form.escalate p{font-size:13px;color:#8a7f70;margin:0 0 8px}
-    button.link{font:inherit;font-size:13px;color:#9b3b21;background:none;border:none;padding:0;cursor:pointer;text-decoration:underline}
-    button.link:hover{color:#7a2d18}
-  </style></head>
+  ${PAGE_STYLE}
+  </head>
   <body><div class="card">
     <h1>${escapeHtml(headline)}</h1>
     <p>${detail}</p>
@@ -263,15 +339,28 @@ function confirmationPage(opts: ConfirmationOpts): string {
   </div></body></html>`;
 }
 
+const PAGE_STYLE = `<style>
+  body{font-family:'Source Serif 4',Georgia,serif;background:#faf7f1;color:#2a2420;margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}
+  .card{max-width:520px;width:100%;background:#fff;border:1px solid #e6decf;border-radius:8px;padding:36px 32px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  h1{font-size:24px;margin:0 0 12px;letter-spacing:-.01em}
+  p{font-size:15px;line-height:1.6;color:#554a40;margin:8px 0}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#f4efe5;padding:2px 6px;border-radius:3px;font-size:13px}
+  strong{color:#2a2420}
+  .muted{color:#8a7f70;font-size:13px;margin-top:22px;border-top:1px solid #e6decf;padding-top:14px;white-space:pre-line}
+  form.primary{margin-top:18px}
+  .btn{display:inline-block;font:inherit;font-size:15px;background:#9b3b21;color:#fff;border:none;border-radius:5px;padding:10px 18px;cursor:pointer}
+  .btn:hover{background:#7a2d18}
+  form.escalate{margin-top:18px;padding-top:14px;border-top:1px solid #e6decf}
+  form.escalate p{font-size:13px;color:#8a7f70;margin:0 0 8px}
+  button.link{font:inherit;font-size:13px;color:#9b3b21;background:none;border:none;padding:0;cursor:pointer;text-decoration:underline}
+  button.link:hover{color:#7a2d18}
+</style>`;
+
 function errorPage(message: string): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8" />
   <title>Unsubscribe</title>
-  <style>
-    body{font-family:'Source Serif 4',Georgia,serif;background:#faf7f1;color:#2a2420;margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}
-    .card{max-width:520px;width:100%;background:#fff;border:1px solid #e6decf;border-radius:8px;padding:36px 32px}
-    h1{font-size:22px;margin:0 0 12px}
-    p{font-size:15px;line-height:1.6;color:#554a40}
-  </style></head>
+  ${PAGE_STYLE}
+  </head>
   <body><div class="card"><h1>Unsubscribe</h1><p>${escapeHtml(message)}</p></div></body></html>`;
 }
 

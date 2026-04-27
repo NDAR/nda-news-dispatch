@@ -99,9 +99,16 @@ async function processRecord(record: SQSRecord): Promise<void> {
     job.email,
   )}&t=${viewToken}`;
   const mailtoUnsub = `mailto:unsubscribe@${FROM_ADDRESS.replace(/.*@/, '').replace(/>.*/, '')}?subject=unsubscribe`;
+  // Note: we deliberately do NOT include `List-Unsubscribe-Post:
+  // List-Unsubscribe=One-Click`. RFC 8058 one-click is regularly fired by
+  // enterprise link-scanning gateways (Microsoft Defender Safe Links,
+  // Proofpoint URL Defense, Mimecast, Barracuda, etc.) before delivery,
+  // unsubscribing real subscribers without their action. Clients that
+  // honor the bare `List-Unsubscribe` header still surface a native
+  // "Unsubscribe" affordance — it just opens the URL instead of POSTing
+  // to it, which routes through our confirmation page.
   const headers = [
     { Name: 'List-Unsubscribe', Value: `<${mailtoUnsub}>, <${unsubUrl}>` },
-    { Name: 'List-Unsubscribe-Post', Value: 'List-Unsubscribe=One-Click' },
     { Name: 'X-Campaign-Id', Value: job.campaignId },
   ];
 
