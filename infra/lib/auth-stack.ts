@@ -41,7 +41,7 @@ export class AuthStack extends Stack {
         requireSymbols: true,
         tempPasswordValidity: Duration.days(3),
       },
-      mfa: Mfa.OPTIONAL,
+      mfa: Mfa.REQUIRED,
       mfaSecondFactor: { sms: false, otp: true },
       accountRecovery: AccountRecovery.EMAIL_ONLY,
       advancedSecurityMode: AdvancedSecurityMode.AUDIT,

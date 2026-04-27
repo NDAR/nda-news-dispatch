@@ -321,6 +321,22 @@ aws cognito-idp admin-set-user-password \
   --password 'YourTempPassword123!' --permanent
 ```
 
+The user pool requires TOTP MFA. On first sign-in via the Hosted UI,
+the admin will be prompted to scan a QR code with an authenticator app
+(Authy, Google Authenticator, 1Password, Bitwarden, etc.) and enter a
+6-digit code to complete enrollment. Subsequent logins prompt for the
+code after the password.
+
+If an admin loses their authenticator, an operator with AWS access can
+reset their MFA enrollment so they can re-enroll on next login:
+
+```bash
+aws cognito-idp admin-set-user-mfa-preference \
+  --user-pool-id "$POOL" \
+  --username "user@example.com" \
+  --software-token-mfa-settings Enabled=false,PreferredMfa=false
+```
+
 ### 8. Build + deploy the SPA
 
 The SPA reads its config at build time from `web/.env.production`:
