@@ -3,7 +3,7 @@ A serverless newsletter sender for small admin teams. Compose HTML or
 WYSIWYG, segment subscribers by tag, send (or schedule) campaigns through
 SES, track delivery / opens / clicks / bounces, and self-serve unsubscribes.
 
-<img width="1181" height="645" alt="Screenshot 2026-04-26 at 8 52 55 PM" src="https://github.com/user-attachments/assets/5a88ac21-c311-4d05-84f3-3ea12de9899f" />
+<img width="1183" height="654" alt="Screenshot 2026-04-26 at 8 59 53 PM" src="https://github.com/user-attachments/assets/3f1e850d-6144-42c8-8009-895625a40a39" />
 <br>
 <img width="1182" height="650" alt="Screenshot 2026-04-26 at 8 53 26 PM" src="https://github.com/user-attachments/assets/bbf8a77b-29b1-42e5-aad0-e532352f21fd" />
 
