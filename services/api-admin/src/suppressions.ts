@@ -1,15 +1,19 @@
 import type { APIGatewayProxyHandler, APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
-  DeleteCommand,
   DynamoDBDocumentClient,
   GetCommand,
-  PutCommand,
-  QueryCommand,
   ScanCommand,
-  UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
-import { contactStatusIndexFields } from '../../../packages/shared/src';
+import {
+  applySuppression,
+  parseSuppressionSk,
+  removeAllSuppressions,
+  removeSuppression as removeOneSuppression,
+  VALID_SUPPRESSION_REASONS,
+  type SuppressionReason,
+  type SuppressionScope,
+} from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -17,7 +21,8 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
 const TABLE = mustEnv('TABLE_NAME');
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const VALID_REASONS = ['manual', 'bounce', 'complaint', 'unsubscribe'] as const;
+const TYPE_NAME_TTL_MS = 60_000;
+const typeNameCache = new Map<string, { at: number; name?: string }>();
 
 export const handler: APIGatewayProxyHandler = async (event) => {
   try {
@@ -28,7 +33,7 @@ export const handler: APIGatewayProxyHandler = async (event) => {
       case 'POST /admin/suppressions':
         return ok(await addSuppression(parseBody(event), claimsOf(event)));
       case 'DELETE /admin/suppressions/{email}':
-        return ok(await removeSuppression(decodeEmail(event)));
+        return ok(await deleteSuppression(event));
       default:
         return err(404, 'not-found', `No route for ${route}`);
     }
@@ -42,129 +47,175 @@ export const handler: APIGatewayProxyHandler = async (event) => {
 
 interface SuppressionInput {
   email?: string;
+  scope?: string;
+  typeId?: string;
   reason?: string;
   note?: string;
 }
 
-async function listSuppressions(event: APIGatewayProxyEvent): Promise<{ items: unknown[] }> {
-  // For small suppression lists, scan with filter is fine. Revisit with a
-  // dedicated GSI when the suppression table grows past ~10k items.
+interface SuppressionListItem {
+  email: string;
+  scope: SuppressionScope;
+  typeId?: string;
+  typeName?: string;
+  reason: string;
+  source?: string;
+  campaignId?: string;
+  messageId?: string;
+  note?: string;
+  addedBy?: string;
+  addedAt: string;
+}
+
+async function listSuppressions(event: APIGatewayProxyEvent): Promise<{ items: SuppressionListItem[] }> {
+  // Single-table layout: SUPP#<email> rows have SK starting with TYPE#. We
+  // also include legacy REASON#-prefixed rows so the operator can see (and
+  // delete) them during the migration window.
   const limit = clampInt(event.queryStringParameters?.limit, 1, 500, 100);
+  const scope = parseScopeQuery(event.queryStringParameters?.scope);
+  const typeIdFilter = event.queryStringParameters?.typeId;
   const res = await ddb.send(
     new ScanCommand({
       TableName: TABLE,
-      FilterExpression: 'begins_with(PK, :p) AND begins_with(SK, :s)',
-      ExpressionAttributeValues: { ':p': 'SUPP#', ':s': 'REASON#' },
+      FilterExpression: 'begins_with(PK, :p) AND (begins_with(SK, :tsk) OR begins_with(SK, :rsk))',
+      ExpressionAttributeValues: { ':p': 'SUPP#', ':tsk': 'TYPE#', ':rsk': 'REASON#' },
       Limit: limit,
     }),
   );
-  return { items: (res.Items ?? []).map(stripKeys) };
+  const items: SuppressionListItem[] = [];
+  for (const raw of res.Items ?? []) {
+    const item = await mapSuppressionItem(raw as Record<string, unknown>);
+    if (!item) continue;
+    if (scope && item.scope !== scope) continue;
+    if (typeIdFilter && item.typeId !== typeIdFilter) continue;
+    items.push(item);
+  }
+  return { items };
 }
 
 async function addSuppression(
   input: SuppressionInput,
   claims: Claims,
-): Promise<{ email: string; reason: string }> {
+): Promise<{ email: string; scope: SuppressionScope; typeId?: string; reason: string }> {
   const email = (input.email ?? '').trim().toLowerCase();
   if (!EMAIL_RE.test(email)) throw new HttpError(400, 'invalid-email', 'Invalid email');
-  const reason = (input.reason ?? 'manual').trim().toLowerCase();
-  if (!VALID_REASONS.includes(reason as (typeof VALID_REASONS)[number])) {
-    throw new HttpError(400, 'invalid-reason', `reason must be one of: ${VALID_REASONS.join(', ')}`);
+  const reason = ((input.reason ?? 'manual').trim().toLowerCase()) as SuppressionReason;
+  if (!(VALID_SUPPRESSION_REASONS as readonly string[]).includes(reason)) {
+    throw new HttpError(
+      400,
+      'invalid-reason',
+      `reason must be one of: ${VALID_SUPPRESSION_REASONS.join(', ')}`,
+    );
   }
-  const now = new Date().toISOString();
-  await ddb.send(
-    new PutCommand({
-      TableName: TABLE,
-      Item: {
-        PK: `SUPP#${email}`,
-        SK: `REASON#${reason}`,
-        email,
-        reason,
-        source: 'manual',
-        note: input.note,
-        addedAt: now,
-        addedBy: claims.email ?? claims.sub,
-      },
-    }),
-  );
-  const existing = await ddb.send(
-    new GetCommand({ TableName: TABLE, Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' } }),
-  );
-  const status =
-    existing.Item?.status === 'unsubscribed' || existing.Item?.status === 'bounced'
-      ? existing.Item.status
-      : 'active';
-  await ddb.send(
-    new UpdateCommand({
-      TableName: TABLE,
-      Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' },
-      UpdateExpression:
-        'SET suppressed = :suppressed, suppressedAt = :suppressedAt, suppressionReason = :suppressionReason, GSI2PK = :gsi2pk, GSI2SK = :gsi2sk',
-      ConditionExpression: 'attribute_exists(PK)',
-      ExpressionAttributeValues: {
-        ':suppressed': true,
-        ':suppressedAt': now,
-        ':suppressionReason': reason,
-        ':gsi2pk': contactStatusIndexFields(email, status).GSI2PK,
-        ':gsi2sk': contactStatusIndexFields(email, status).GSI2SK,
-      },
-    }),
-  ).catch(() => undefined);
-  return { email, reason };
+  const scope = parseScopeBody(input.scope);
+  const typeId = scope === 'type' ? cleanTypeId(input.typeId) : undefined;
+  if (scope === 'type' && !typeId) {
+    throw new HttpError(400, 'missing-type-id', 'typeId is required when scope is "type"');
+  }
+  if (typeId) await assertTypeExists(typeId);
+
+  await applySuppression(ddb, TABLE, {
+    email,
+    scope,
+    typeId,
+    reason,
+    source: 'manual',
+    note: input.note,
+    addedBy: claims.email ?? claims.sub,
+  });
+  return { email, scope, typeId, reason };
 }
 
-async function removeSuppression(email: string): Promise<{ email: string; removed: number }> {
-  const existing = await ddb.send(
-    new QueryCommand({
-      TableName: TABLE,
-      KeyConditionExpression: 'PK = :pk',
-      ExpressionAttributeValues: { ':pk': `SUPP#${email}` },
-    }),
+async function deleteSuppression(event: APIGatewayProxyEvent): Promise<{ email: string; removed: number }> {
+  const email = decodeEmail(event);
+  const qs = event.queryStringParameters ?? {};
+  const scopeRaw = (qs.scope ?? '').toLowerCase();
+  if (scopeRaw === 'all') {
+    const removed = await removeAllSuppressions(ddb, TABLE, email);
+    return { email, removed };
+  }
+  if (scopeRaw === 'global' || scopeRaw === 'type') {
+    const typeId = scopeRaw === 'type' ? cleanTypeId(qs.typeId) : undefined;
+    if (scopeRaw === 'type' && !typeId) {
+      throw new HttpError(400, 'missing-type-id', 'typeId query param is required when scope=type');
+    }
+    await removeOneSuppression(ddb, TABLE, {
+      email,
+      scope: scopeRaw,
+      typeId,
+    });
+    return { email, removed: 1 };
+  }
+  // Default: remove every SUPP row for the email. Preserves the legacy
+  // behavior of `DELETE /admin/suppressions/{email}` and is the path the
+  // SPA uses for "Remove" on the Global tab when they want a clean slate.
+  const removed = await removeAllSuppressions(ddb, TABLE, email);
+  return { email, removed };
+}
+
+async function mapSuppressionItem(item: Record<string, unknown>): Promise<SuppressionListItem | null> {
+  const email = String(item.email ?? '');
+  const sk = String(item.SK ?? '');
+  const parsed = parseSuppressionSk(sk);
+  if (!email || !parsed) return null;
+  const typeName = parsed.scope === 'type' && parsed.typeId
+    ? await loadTypeName(parsed.typeId)
+    : undefined;
+  return {
+    email,
+    scope: parsed.scope,
+    typeId: parsed.typeId,
+    typeName,
+    reason: typeof item.reason === 'string' ? item.reason : 'manual',
+    source: typeof item.source === 'string' ? item.source : undefined,
+    campaignId: typeof item.campaignId === 'string' ? item.campaignId : undefined,
+    messageId: typeof item.messageId === 'string' ? item.messageId : undefined,
+    note: typeof item.note === 'string' ? item.note : undefined,
+    addedBy: typeof item.addedBy === 'string' ? item.addedBy : undefined,
+    addedAt: typeof item.addedAt === 'string' ? item.addedAt : '',
+  };
+}
+
+async function loadTypeName(typeId: string): Promise<string | undefined> {
+  const now = Date.now();
+  const cached = typeNameCache.get(typeId);
+  if (cached && now - cached.at < TYPE_NAME_TTL_MS) return cached.name;
+  const res = await ddb.send(
+    new GetCommand({ TableName: TABLE, Key: { PK: `TYPE#${typeId}`, SK: 'LATEST' } }),
   );
-  const items = existing.Items ?? [];
-  await Promise.all(
-    items.map((item: Record<string, unknown>) =>
-      ddb.send(
-        new DeleteCommand({
-          TableName: TABLE,
-          Key: { PK: item.PK, SK: item.SK },
-        }),
-      ),
-    ),
-  );
-  const profile = await ddb.send(
-    new GetCommand({ TableName: TABLE, Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' } }),
-  );
-  const status =
-    profile.Item?.status === 'unsubscribed' || profile.Item?.status === 'bounced'
-      ? profile.Item.status
-      : 'active';
-  await ddb.send(
-    new UpdateCommand({
-      TableName: TABLE,
-      Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' },
-      UpdateExpression:
-        'SET suppressed = :suppressed, GSI2PK = :gsi2pk, GSI2SK = :gsi2sk REMOVE suppressedAt, suppressionReason',
-      ConditionExpression: 'attribute_exists(PK)',
-      ExpressionAttributeValues: {
-        ':suppressed': false,
-        ':gsi2pk': contactStatusIndexFields(email, status).GSI2PK,
-        ':gsi2sk': contactStatusIndexFields(email, status).GSI2SK,
-      },
-    }),
-  ).catch(() => undefined);
-  return { email, removed: items.length };
+  const name = typeof res.Item?.name === 'string' ? res.Item.name : undefined;
+  typeNameCache.set(typeId, { at: now, name });
+  return name;
+}
+
+async function assertTypeExists(typeId: string): Promise<void> {
+  const name = await loadTypeName(typeId);
+  if (name === undefined) {
+    throw new HttpError(404, 'type-not-found', `Newsletter type ${typeId} not found`);
+  }
+}
+
+function parseScopeQuery(raw: string | undefined): SuppressionScope | null {
+  if (!raw) return null;
+  const v = raw.toLowerCase();
+  if (v === 'global' || v === 'type') return v;
+  return null;
+}
+
+function parseScopeBody(raw: string | undefined): SuppressionScope {
+  const v = (raw ?? 'global').toLowerCase();
+  if (v === 'global' || v === 'type') return v;
+  throw new HttpError(400, 'invalid-scope', 'scope must be "global" or "type"');
+}
+
+function cleanTypeId(raw: string | undefined): string | undefined {
+  const v = (raw ?? '').trim();
+  return v ? v : undefined;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 type Claims = { sub?: string; email?: string };
-
-function stripKeys(item: Record<string, unknown>): Record<string, unknown> {
-  const { PK, SK, GSI1PK, GSI1SK, ...rest } = item as Record<string, unknown>;
-  void PK; void SK; void GSI1PK; void GSI1SK;
-  return rest;
-}
 
 function parseBody<T = Record<string, unknown>>(event: APIGatewayProxyEvent): T {
   if (!event.body) return {} as T;

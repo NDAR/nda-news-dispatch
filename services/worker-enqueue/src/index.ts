@@ -76,10 +76,11 @@ async function processRecord(record: SQSRecord): Promise<void> {
   const tagMode = (meta.Item.tagMode as 'all' | 'any') ?? 'all';
   const tags = (meta.Item.tags as string[] | undefined) ?? [];
   const excludeTags = (meta.Item.excludeTags as string[] | undefined) ?? [];
+  const typeId = typeof meta.Item.typeId === 'string' ? meta.Item.typeId : undefined;
   const claimedAt = new Date().toISOString();
 
   try {
-    const recipients = await materializeAudienceEmails(ddb, TABLE, { tagMode, tags, excludeTags });
+    const recipients = await materializeAudienceEmails(ddb, TABLE, { tagMode, tags, excludeTags, typeId });
     if (recipients.length === 0) {
       await markStatus(id, 'failed', { sentAt: claimedAt, error: 'No recipients matched at send time' });
       return;

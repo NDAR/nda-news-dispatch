@@ -81,6 +81,10 @@ interface PreviewInput {
   tags?: string[];
   excludeTags?: string[];
   tagMode?: 'all' | 'any';
+  /** When provided, the preview drops recipients with a per-type
+   *  unsubscribe for this typeId so the count matches what the matching
+   *  campaign would actually send. */
+  typeId?: string;
 }
 
 interface PreviewSampleContact {
@@ -111,10 +115,11 @@ async function previewAudience(input: PreviewInput): Promise<PreviewResponse> {
   const tagMode = input.tagMode === 'any' ? 'any' : 'all';
   const tags = validTags(input.tags);
   const excludeTags = validTags(input.excludeTags);
+  const typeId = typeof input.typeId === 'string' && input.typeId.trim() ? input.typeId.trim() : undefined;
 
   const [matched, allActive] = await Promise.all([
-    materializeAudienceProfiles(ddb, TABLE, { tags, excludeTags, tagMode }),
-    materializeAudienceProfiles(ddb, TABLE, { tags: [], excludeTags: [], tagMode: 'all' }),
+    materializeAudienceProfiles(ddb, TABLE, { tags, excludeTags, tagMode, typeId }),
+    materializeAudienceProfiles(ddb, TABLE, { tags: [], excludeTags: [], tagMode: 'all', typeId }),
   ]);
   const total = allActive.length;
 

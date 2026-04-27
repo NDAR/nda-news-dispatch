@@ -8,12 +8,15 @@ import {
   listContacts,
   listSuppressions,
   listTags,
+  listTypes,
   patchContact,
   removeSuppression,
   upsertContact,
   uploadCsv,
   type Contact,
+  type NewsletterType,
   type Suppression,
+  type SuppressionScope,
 } from '../api/endpoints';
 
 export const Route = createFileRoute('/_app/subscribers')({
@@ -61,16 +64,38 @@ function SubscribersPage() {
     },
   });
 
-  // Suppression list (everyone the system will refuse to email — sourced from
-  // SES bounces, complaints, public-unsubscribe clicks, and manual additions).
+  // Suppression list — split into two views. "global" is the hard list
+  // (bounces, complaints, operator stop-everything). "type" lists per-newsletter
+  // opt-outs the SES feedback loop and unsubscribe link wrote there.
+  const [suppressionScope, setSuppressionScope] = useState<SuppressionScope>('global');
+  const [suppressionTypeId, setSuppressionTypeId] = useState<string>('');
   const suppressionsQ = useQuery({
-    queryKey: ['suppressions'],
-    queryFn: listSuppressions,
+    queryKey: ['suppressions', suppressionScope, suppressionTypeId],
+    queryFn: () =>
+      listSuppressions({
+        scope: suppressionScope,
+        typeId: suppressionScope === 'type' && suppressionTypeId ? suppressionTypeId : undefined,
+      }),
+    enabled: view === 'suppressions',
+  });
+
+  // Newsletter types power the type picker + per-row badges.
+  const typesQ = useQuery({
+    queryKey: ['types'],
+    queryFn: () => listTypes(),
     enabled: view === 'suppressions',
   });
 
   const removeSuppMut = useMutation({
-    mutationFn: (email: string) => removeSuppression(email),
+    mutationFn: ({
+      email,
+      scope,
+      typeId,
+    }: {
+      email: string;
+      scope: SuppressionScope | 'all';
+      typeId?: string;
+    }) => removeSuppression(email, { scope, typeId }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['suppressions'] }),
   });
 
@@ -217,18 +242,36 @@ function SubscribersPage() {
           {view === 'suppressions' && (
             <SuppressionsPanel
               query={suppressionsQ}
-              onRemove={(email) => {
+              types={typesQ.data ?? []}
+              scope={suppressionScope}
+              onScopeChange={setSuppressionScope}
+              typeFilter={suppressionTypeId}
+              onTypeFilterChange={setSuppressionTypeId}
+              onRemove={(s) => {
+                const target =
+                  s.scope === 'type'
+                    ? `${s.email} from "${s.typeName ?? s.typeId ?? 'this newsletter'}"`
+                    : `${s.email} from the global suppression list`;
                 if (
                   confirm(
-                    `Remove ${email} from the suppression list?\n\n` +
-                      `This will allow campaigns to send to this address again. ` +
-                      `Only do this if you've confirmed the bounce/unsubscribe was a mistake.`,
+                    `Remove ${target}?\n\n` +
+                      (s.scope === 'global'
+                        ? 'This will allow every newsletter to send to this address again. Only do this if the bounce/complaint/manual entry was a mistake.'
+                        : 'This will allow this specific newsletter type to send to the address again. Other types are unaffected.'),
                   )
                 ) {
-                  removeSuppMut.mutate(email);
+                  removeSuppMut.mutate({
+                    email: s.email,
+                    scope: s.scope,
+                    typeId: s.typeId,
+                  });
                 }
               }}
-              removingEmail={removeSuppMut.isPending ? removeSuppMut.variables : undefined}
+              removingKey={
+                removeSuppMut.isPending && removeSuppMut.variables
+                  ? `${removeSuppMut.variables.email}|${removeSuppMut.variables.scope}|${removeSuppMut.variables.typeId ?? ''}`
+                  : undefined
+              }
             />
           )}
           {view === 'subscribers' && (uploadStatus || importQuery.data) && (
@@ -374,72 +417,140 @@ function SubscribersPage() {
 
 function SuppressionsPanel({
   query,
+  types,
+  scope,
+  onScopeChange,
+  typeFilter,
+  onTypeFilterChange,
   onRemove,
-  removingEmail,
+  removingKey,
 }: {
   query: { isLoading: boolean; error: unknown; data?: { items: Suppression[] } };
-  onRemove: (email: string) => void;
-  removingEmail: string | undefined;
+  types: NewsletterType[];
+  scope: SuppressionScope;
+  onScopeChange: (s: SuppressionScope) => void;
+  typeFilter: string;
+  onTypeFilterChange: (id: string) => void;
+  onRemove: (s: Suppression) => void;
+  removingKey: string | undefined;
 }) {
-  if (query.isLoading) {
-    return <p className="muted">Loading suppression list…</p>;
-  }
-  if (query.error) {
-    return (
-      <p style={{ color: 'var(--bad)' }}>
-        Failed to load suppressions: {(query.error as Error).message}
-      </p>
-    );
-  }
   const items = query.data?.items ?? [];
+  const visibleTypes = types.filter((t) => !t.archived);
+
   return (
     <>
-      <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
-        {items.length === 0
-          ? 'No suppressions on file. Bounces, complaints, and unsubscribes will appear here automatically.'
-          : `${items.length} address${items.length === 1 ? '' : 'es'} the system will refuse to send to.`}
-      </div>
-      {items.length > 0 && (
-        <table className="table">
-          <thead>
-            <tr>
-              <th>Email</th>
-              <th>Reason</th>
-              <th>Source</th>
-              <th>Added</th>
-              <th>Note</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {items.map((s) => (
-              <tr key={`${s.email}-${s.reason}`}>
-                <td className="mono-sm">{s.email}</td>
-                <td>
-                  <SuppressionReasonPill reason={s.reason} />
-                </td>
-                <td className="muted" style={{ fontSize: 12 }}>{s.source ?? '—'}</td>
-                <td className="muted mono-sm" style={{ fontSize: 11 }}>
-                  {s.addedAt ? new Date(s.addedAt).toLocaleString() : '—'}
-                </td>
-                <td className="muted" style={{ fontSize: 12 }}>
-                  {s.note || (s.addedBy ? <span className="faint">by {s.addedBy}</span> : '—')}
-                </td>
-                <td className="text-right">
-                  <button
-                    className="btn btn-sm btn-ghost"
-                    onClick={() => onRemove(s.email)}
-                    disabled={removingEmail === s.email}
-                    style={{ color: 'var(--bad)' }}
-                    title="Remove from suppression list"
-                  >
-                    {removingEmail === s.email ? 'Removing…' : 'Remove'}
-                  </button>
-                </td>
-              </tr>
+      <div
+        className="row items-center gap-md"
+        style={{ marginBottom: 12, flexWrap: 'wrap' }}
+      >
+        <div className="segmented">
+          <button
+            className={scope === 'global' ? 'active' : ''}
+            onClick={() => onScopeChange('global')}
+            title="Bounces, complaints, and stop-everything opt-outs"
+          >
+            Global
+          </button>
+          <button
+            className={scope === 'type' ? 'active' : ''}
+            onClick={() => onScopeChange('type')}
+            title="Per-newsletter unsubscribes"
+          >
+            By newsletter type
+          </button>
+        </div>
+        {scope === 'type' && (
+          <select
+            className="select"
+            value={typeFilter}
+            onChange={(e) => onTypeFilterChange(e.target.value)}
+          >
+            <option value="">All newsletter types</option>
+            {visibleTypes.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name}
+              </option>
             ))}
-          </tbody>
-        </table>
+          </select>
+        )}
+      </div>
+
+      {query.isLoading && <p className="muted">Loading suppression list…</p>}
+      {query.error && (
+        <p style={{ color: 'var(--bad)' }}>
+          Failed to load suppressions: {(query.error as Error).message}
+        </p>
+      )}
+
+      {!query.isLoading && !query.error && (
+        <>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+            {items.length === 0 ? (
+              scope === 'global'
+                ? 'No global suppressions. Hard bounces, complaints, and operator opt-outs will appear here automatically.'
+                : typeFilter
+                  ? 'Nobody has unsubscribed from this newsletter type.'
+                  : 'No per-newsletter unsubscribes on file.'
+            ) : (
+              `${items.length} ${scope === 'global' ? 'address' : 'unsubscribe'}${items.length === 1 ? '' : 'es'} on file.`
+            )}
+          </div>
+          {items.length > 0 && (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Email</th>
+                  <th>Reason</th>
+                  {scope === 'type' && <th>Newsletter</th>}
+                  <th>Source</th>
+                  <th>Added</th>
+                  <th>Note</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {items.map((s) => {
+                  const rowKey = `${s.email}|${s.scope}|${s.typeId ?? ''}`;
+                  return (
+                    <tr key={rowKey}>
+                      <td className="mono-sm">{s.email}</td>
+                      <td>
+                        <SuppressionReasonPill reason={s.reason} />
+                      </td>
+                      {scope === 'type' && (
+                        <td className="muted" style={{ fontSize: 12 }}>
+                          {s.typeName ?? s.typeId ?? '—'}
+                        </td>
+                      )}
+                      <td className="muted" style={{ fontSize: 12 }}>{s.source ?? '—'}</td>
+                      <td className="muted mono-sm" style={{ fontSize: 11 }}>
+                        {s.addedAt ? new Date(s.addedAt).toLocaleString() : '—'}
+                      </td>
+                      <td className="muted" style={{ fontSize: 12 }}>
+                        {s.note || (s.addedBy ? <span className="faint">by {s.addedBy}</span> : '—')}
+                      </td>
+                      <td className="text-right">
+                        <button
+                          className="btn btn-sm btn-ghost"
+                          onClick={() => onRemove(s)}
+                          disabled={removingKey === rowKey}
+                          style={{ color: 'var(--bad)' }}
+                          title={
+                            s.scope === 'global'
+                              ? 'Remove from the global suppression list'
+                              : 'Remove this per-newsletter opt-out'
+                          }
+                        >
+                          {removingKey === rowKey ? 'Removing…' : 'Remove'}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </>
       )}
     </>
   );

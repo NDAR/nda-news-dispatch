@@ -64,6 +64,12 @@ interface Contact {
   status: 'active' | 'unsubscribed' | 'bounced';
   joined: string;
   updatedAt: string;
+  /** Derived: true if any suppression (global or per-type) is in effect. */
+  suppressed?: boolean;
+  /** Hard suppression — blocks every send regardless of type. */
+  suppressedGlobal?: boolean;
+  /** Per-type suppressions (newsletter typeIds the contact has opted out of). */
+  suppressedTypes?: string[];
 }
 
 async function listContacts(event: APIGatewayProxyEvent): Promise<{ items: Contact[]; next?: string }> {
@@ -192,24 +198,30 @@ async function writeContact(c: Contact, prevTags: string[]): Promise<void> {
     new GetCommand({ TableName: TABLE, Key: { PK: `CONTACT#${c.email}`, SK: 'PROFILE' } }),
   );
 
+  // Preserve every suppression-related attribute across the Put. PutCommand
+  // wholesale-replaces the item, so anything we don't include is lost.
+  const preservedTypeSet = readStringSet(existing.Item?.suppressedTypes);
+  const item: Record<string, unknown> = {
+    PK: `CONTACT#${c.email}`,
+    SK: 'PROFILE',
+    email: c.email,
+    name: c.name,
+    org: c.org,
+    tags: c.tags,
+    status: c.status,
+    joined: c.joined,
+    updatedAt: c.updatedAt,
+    suppressed: existing.Item?.suppressed === true,
+    suppressedGlobal: existing.Item?.suppressedGlobal === true,
+    suppressedAt: existing.Item?.suppressedAt,
+    suppressionReason: existing.Item?.suppressionReason,
+    ...contactStatusIndexFields(c.email, c.status),
+  };
+  if (preservedTypeSet.length > 0) item.suppressedTypes = new Set(preservedTypeSet);
   await ddb.send(
     new PutCommand({
       TableName: TABLE,
-      Item: {
-        PK: `CONTACT#${c.email}`,
-        SK: 'PROFILE',
-        email: c.email,
-        name: c.name,
-        org: c.org,
-        tags: c.tags,
-        status: c.status,
-        joined: c.joined,
-        updatedAt: c.updatedAt,
-        suppressed: existing.Item?.suppressed === true,
-        suppressedAt: existing.Item?.suppressedAt,
-        suppressionReason: existing.Item?.suppressionReason,
-        ...contactStatusIndexFields(c.email, c.status),
-      },
+      Item: item,
     }),
   );
 
@@ -243,6 +255,10 @@ async function batchGetProfiles(emails: string[]): Promise<Contact[]> {
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function toContact(item: Record<string, unknown>): Contact {
+  const suppressedTypes = readStringSet(item.suppressedTypes);
+  const suppressedGlobal = item.suppressedGlobal === true;
+  const legacySuppressed = item.suppressed === true;
+  const suppressed = suppressedGlobal || suppressedTypes.length > 0 || legacySuppressed;
   return {
     email: String(item.email),
     name: String(item.name ?? ''),
@@ -251,7 +267,24 @@ function toContact(item: Record<string, unknown>): Contact {
     status: (item.status as Contact['status'] | undefined) ?? 'active',
     joined: String(item.joined ?? ''),
     updatedAt: String(item.updatedAt ?? ''),
+    suppressed,
+    suppressedGlobal: suppressedGlobal || (legacySuppressed && suppressedTypes.length === 0),
+    suppressedTypes: suppressedTypes.length > 0 ? suppressedTypes : undefined,
   };
+}
+
+function readStringSet(value: unknown): string[] {
+  if (!value) return [];
+  if (value instanceof Set) {
+    return [...value].filter((v): v is string => typeof v === 'string');
+  }
+  if (Array.isArray(value)) {
+    return value.filter((v): v is string => typeof v === 'string');
+  }
+  if (typeof value === 'object' && value !== null && Array.isArray((value as { values?: unknown[] }).values)) {
+    return ((value as { values: unknown[] }).values).filter((v): v is string => typeof v === 'string');
+  }
+  return [];
 }
 
 function parseBody(event: APIGatewayProxyEvent): ContactInput {

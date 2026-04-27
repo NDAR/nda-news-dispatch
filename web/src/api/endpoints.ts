@@ -12,6 +12,12 @@ export interface Contact {
   status: ContactStatus;
   joined: string;
   updatedAt: string;
+  /** Derived: true if any suppression (global or per-type) is in effect. */
+  suppressed?: boolean;
+  /** Hard suppression — blocks every send regardless of newsletter type. */
+  suppressedGlobal?: boolean;
+  /** Per-type opt-outs (newsletter typeIds the contact has unsubscribed from). */
+  suppressedTypes?: string[];
 }
 
 export interface Template {
@@ -318,25 +324,61 @@ export const updateSettings = (s: Partial<OrgSettings>) =>
 
 // ── Suppressions ────────────────────────────────────────────────────────────
 
+export type SuppressionScope = 'global' | 'type';
+
 export interface Suppression {
   email: string;
+  scope: SuppressionScope;
+  /** Newsletter type id when scope is "type". */
+  typeId?: string;
+  /** Display name of the newsletter type, when the API can resolve it. */
+  typeName?: string;
   reason: string;
   addedAt: string;
   source?: string;
+  campaignId?: string;
   note?: string;
   addedBy?: string;
   messageId?: string;
 }
 
-export const listSuppressions = () =>
-  api<{ items: Suppression[] }>('/admin/suppressions');
-export const addSuppression = (input: { email: string; reason?: string; note?: string }) =>
-  api<{ email: string; reason: string }>('/admin/suppressions', {
-    method: 'POST',
-    body: JSON.stringify(input),
-  });
-export const removeSuppression = (email: string) =>
-  api<{ email: string; removed: number }>(
-    `/admin/suppressions/${encodeURIComponent(email)}`,
+export const listSuppressions = (
+  opts: { scope?: SuppressionScope; typeId?: string; limit?: number } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.scope) qs.set('scope', opts.scope);
+  if (opts.typeId) qs.set('typeId', opts.typeId);
+  if (opts.limit) qs.set('limit', String(opts.limit));
+  const s = qs.toString();
+  return api<{ items: Suppression[] }>(`/admin/suppressions${s ? `?${s}` : ''}`);
+};
+
+export const addSuppression = (
+  input: {
+    email: string;
+    scope?: SuppressionScope;
+    typeId?: string;
+    reason?: string;
+    note?: string;
+  },
+) =>
+  api<{ email: string; scope: SuppressionScope; typeId?: string; reason: string }>(
+    '/admin/suppressions',
+    { method: 'POST', body: JSON.stringify(input) },
+  );
+
+/** Removes one scoped suppression row. With no scope, removes every SUPP row
+ *  for the email — preserves the legacy "delete all" UX from the Global tab. */
+export const removeSuppression = (
+  email: string,
+  opts: { scope?: SuppressionScope | 'all'; typeId?: string } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (opts.scope) qs.set('scope', opts.scope);
+  if (opts.typeId) qs.set('typeId', opts.typeId);
+  const s = qs.toString();
+  return api<{ email: string; removed: number }>(
+    `/admin/suppressions/${encodeURIComponent(email)}${s ? `?${s}` : ''}`,
     { method: 'DELETE' },
   );
+};

@@ -4,9 +4,8 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
   DynamoDBDocumentClient,
   UpdateCommand,
-  PutCommand,
 } from '@aws-sdk/lib-dynamodb';
-import { contactStatusIndexFields, suppressionState } from '../../../packages/shared/src';
+import { applySuppression, contactStatusIndexFields, suppressionState } from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -95,7 +94,13 @@ async function processRecord(record: SNSEventRecord): Promise<void> {
       await bumpStats(campaignId, { bounced: 1 });
       await setRcpt(campaignId, email, { state: 'bounced', bouncedAt: now(), bounceType });
       if (permanent) {
-        await suppress(email, 'bounce', ses.mail.messageId);
+        await applySuppression(ddb, TABLE, {
+          email,
+          scope: 'global',
+          reason: 'bounce',
+          source: 'ses',
+          messageId: ses.mail.messageId,
+        });
         await setContactStatus(email, 'bounced');
       }
       break;
@@ -103,7 +108,13 @@ async function processRecord(record: SNSEventRecord): Promise<void> {
     case 'Complaint':
       await bumpStats(campaignId, { complained: 1 });
       await setRcpt(campaignId, email, { state: 'complained', complainedAt: now() });
-      await suppress(email, 'complaint', ses.mail.messageId);
+      await applySuppression(ddb, TABLE, {
+        email,
+        scope: 'global',
+        reason: 'complaint',
+        source: 'ses',
+        messageId: ses.mail.messageId,
+      });
       await setContactStatus(email, 'unsubscribed');
       break;
     case 'Reject':
@@ -256,23 +267,6 @@ async function setRcpt(campaignId: string, email: string, patch: Record<string, 
       UpdateExpression: 'SET ' + sets.join(', '),
       ExpressionAttributeNames: names,
       ExpressionAttributeValues: values,
-    }),
-  );
-}
-
-async function suppress(email: string, reason: 'bounce' | 'complaint', messageId: string): Promise<void> {
-  await ddb.send(
-    new PutCommand({
-      TableName: TABLE,
-      Item: {
-        PK: `SUPP#${email}`,
-        SK: `REASON#${reason}`,
-        email,
-        reason,
-        source: 'ses',
-        messageId,
-        addedAt: now(),
-      },
     }),
   );
 }

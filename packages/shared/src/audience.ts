@@ -10,6 +10,12 @@ export interface AudienceSelection {
   tagMode: 'all' | 'any';
   tags: string[];
   excludeTags: string[];
+  /** Newsletter type the campaign is being sent for. When provided, the
+   *  filter drops recipients with a per-type suppression for this typeId in
+   *  addition to globally-suppressed recipients. Without a typeId, only
+   *  global suppressions block sends — this matches the legacy behavior and
+   *  keeps the audience-preview endpoint working for type-less previews. */
+  typeId?: string;
 }
 
 export async function materializeAudienceProfiles(
@@ -19,10 +25,11 @@ export async function materializeAudienceProfiles(
 ): Promise<AudienceProfile[]> {
   const excludeSets = await Promise.all(opts.excludeTags.map((tag) => queryTagEmails(ddb, tableName, tag)));
   const excluded = union(excludeSets);
+  const allow = makeSuppressionFilter(opts.typeId);
 
   if (opts.tags.length === 0) {
     const activeProfiles = await queryActiveProfiles(ddb, tableName);
-    return activeProfiles.filter((profile) => !profile.suppressed && !excluded.has(profile.email));
+    return activeProfiles.filter((profile) => allow(profile) && !excluded.has(profile.email));
   }
 
   const tagSets = await Promise.all(opts.tags.map((tag) => queryTagEmails(ddb, tableName, tag)));
@@ -43,7 +50,7 @@ export async function materializeAudienceProfiles(
   return candidates
     .map((email) => byEmail.get(email))
     .filter((profile): profile is AudienceProfile =>
-      !!profile && profile.status === 'active' && !profile.suppressed,
+      !!profile && profile.status === 'active' && allow(profile),
     );
 }
 
@@ -54,6 +61,14 @@ export async function materializeAudienceEmails(
 ): Promise<string[]> {
   const profiles = await materializeAudienceProfiles(ddb, tableName, opts);
   return profiles.map((profile) => profile.email);
+}
+
+function makeSuppressionFilter(typeId: string | undefined): (profile: AudienceProfile) => boolean {
+  return (profile) => {
+    if (profile.suppressedGlobal) return false;
+    if (typeId && profile.suppressedTypes.includes(typeId)) return false;
+    return true;
+  };
 }
 
 async function queryActiveProfiles(

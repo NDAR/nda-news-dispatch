@@ -124,7 +124,7 @@ async function upsertContact(c: ContactUpsert): Promise<boolean> {
       ? existing.status
       : 'active';
 
-  const profile = {
+  const profile: Record<string, unknown> = {
     PK: `CONTACT#${c.email}`,
     SK: 'PROFILE',
     email: c.email,
@@ -135,10 +135,17 @@ async function upsertContact(c: ContactUpsert): Promise<boolean> {
     joined: existing?.joined ?? now.slice(0, 10),
     updatedAt: now,
     suppressed: existing?.suppressed === true,
+    suppressedGlobal: existing?.suppressedGlobal === true,
     suppressedAt: existing?.suppressedAt,
     suppressionReason: existing?.suppressionReason,
     ...contactStatusIndexFields(c.email, status),
   };
+  // Preserve the per-type suppression String Set across an upsert. PutCommand
+  // overwrites the entire item, so we must read it from `existing` and
+  // re-attach. DDB drops empty Sets, so only set the field when there's
+  // something to keep.
+  const types = readPreservedTypeSet(existing?.suppressedTypes);
+  if (types.length > 0) profile.suppressedTypes = new Set(types);
 
   const requests: { PutRequest?: unknown; DeleteRequest?: unknown }[] = [
     { PutRequest: { Item: profile } },
@@ -193,8 +200,32 @@ function extractImportId(key: string): string | null {
   return m ? m[1] : null;
 }
 
+function readPreservedTypeSet(value: unknown): string[] {
+  if (!value) return [];
+  if (value instanceof Set) {
+    return [...value].filter((v): v is string => typeof v === 'string');
+  }
+  if (Array.isArray(value)) {
+    return value.filter((v): v is string => typeof v === 'string');
+  }
+  if (typeof value === 'object' && value !== null && Array.isArray((value as { values?: unknown[] }).values)) {
+    return ((value as { values: unknown[] }).values).filter((v): v is string => typeof v === 'string');
+  }
+  return [];
+}
+
 function existingSuppressed(item: Record<string, unknown> | undefined): boolean {
-  return item?.suppressed === true;
+  // CSV import skips contacts with a hard global suppression (bounce,
+  // complaint, or operator opt-out-of-everything). Per-type suppressions
+  // don't block import — the address is still a valid recipient for any
+  // newsletter type they haven't opted out of.
+  if (!item) return false;
+  if (item.suppressedGlobal === true) return true;
+  // Pre-migration legacy rows store only the flat `suppressed` boolean;
+  // treat them as global so we don't accidentally re-import a bouncing
+  // address that hasn't been migrated yet.
+  if (item.suppressedGlobal === undefined && item.suppressed === true) return true;
+  return false;
 }
 
 /**

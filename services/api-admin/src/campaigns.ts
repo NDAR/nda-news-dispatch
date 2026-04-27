@@ -332,8 +332,9 @@ async function sendCampaign(
   const testOnly = !!input.testOnly;
   const actor = claims.email ?? claims.sub ?? 'unknown';
 
+  const typeId = typeof meta.Item.typeId === 'string' ? meta.Item.typeId : undefined;
   if (testOnly) {
-    await materializeAudienceEmails(ddb, TABLE, { tagMode, tags, excludeTags });
+    await materializeAudienceEmails(ddb, TABLE, { tagMode, tags, excludeTags, typeId });
     return { id, status: 'draft', enqueued: 0 };
   }
 

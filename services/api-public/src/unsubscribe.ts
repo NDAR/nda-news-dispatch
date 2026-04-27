@@ -3,12 +3,11 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
   DynamoDBDocumentClient,
   GetCommand,
-  PutCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import {
+  applySuppression,
   contactStatusIndexFields,
-  suppressionState,
   verifyUnsubscribeToken,
   type OrgSettings,
 } from '../../../packages/shared/src';
@@ -24,6 +23,9 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const SETTINGS_TTL_MS = 60_000;
 let cachedSettings: { at: number; settings: OrgSettings } | null = null;
+
+const TYPE_NAME_TTL_MS = 60_000;
+const typeNameCache = new Map<string, { at: number; name?: string }>();
 
 async function loadSettings(): Promise<OrgSettings> {
   const now = Date.now();
@@ -43,16 +45,46 @@ async function loadSettings(): Promise<OrgSettings> {
   return settings;
 }
 
+interface CampaignContext {
+  campaignId: string;
+  typeId?: string;
+  typeName?: string;
+}
+
+async function loadCampaignContext(campaignId: string): Promise<CampaignContext> {
+  const res = await ddb.send(
+    new GetCommand({ TableName: TABLE, Key: { PK: `CAMPAIGN#${campaignId}`, SK: 'META' } }),
+  );
+  const typeId = typeof res.Item?.typeId === 'string' ? res.Item.typeId : undefined;
+  const typeName = typeId ? await loadTypeName(typeId) : undefined;
+  return { campaignId, typeId, typeName };
+}
+
+async function loadTypeName(typeId: string): Promise<string | undefined> {
+  const now = Date.now();
+  const cached = typeNameCache.get(typeId);
+  if (cached && now - cached.at < TYPE_NAME_TTL_MS) return cached.name;
+  const res = await ddb.send(
+    new GetCommand({ TableName: TABLE, Key: { PK: `TYPE#${typeId}`, SK: 'LATEST' } }),
+  );
+  const name = typeof res.Item?.name === 'string' ? res.Item.name : undefined;
+  typeNameCache.set(typeId, { at: now, name });
+  return name;
+}
+
 /**
  * Public, unauthenticated endpoints for unsubscribe:
- *   GET  /public/u  — browser-click unsubscribe; validates HMAC, returns confirmation HTML
- *   POST /public/u  — RFC 8058 one-click unsubscribe (headers: List-Unsubscribe + List-Unsubscribe-Post)
+ *   GET  /public/u             — browser-click unsubscribe; per-type by default
+ *   POST /public/u             — RFC 8058 one-click unsubscribe (per-type)
+ *   POST /public/u?scope=all   — escalate from confirmation page to global
  */
 export const handler: APIGatewayProxyHandler = async (event) => {
-  const { c, e, t } = (event.queryStringParameters ?? {}) as Record<string, string | undefined>;
-  const campaignId = c ?? '';
-  const email = (e ?? '').toLowerCase();
-  const token = t ?? '';
+  const qs = (event.queryStringParameters ?? {}) as Record<string, string | undefined>;
+  const campaignId = qs.c ?? '';
+  const email = (qs.e ?? '').toLowerCase();
+  const token = qs.t ?? '';
+  const scopeParam = (qs.scope ?? '').toLowerCase();
+  const escalateGlobal = scopeParam === 'all' || scopeParam === 'global';
 
   if (!campaignId || !EMAIL_RE.test(email) || !token) {
     return html(400, errorPage('Invalid unsubscribe link'));
@@ -61,63 +93,91 @@ export const handler: APIGatewayProxyHandler = async (event) => {
     return html(400, errorPage('This unsubscribe link has expired or is invalid'));
   }
 
+  let context: CampaignContext;
   try {
-    await recordUnsubscribe(campaignId, email);
+    context = await loadCampaignContext(campaignId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(JSON.stringify({ level: 'error', msg: 'load-campaign-failed', campaignId, err: msg }));
+    context = { campaignId };
+  }
+
+  // If the operator clicks "Unsubscribe from all" on the confirmation page
+  // (or a partner integration POSTs ?scope=all), record both layers — global
+  // hard suppression plus, if there's a typeId, the per-type entry too so
+  // history is unambiguous.
+  const scope: 'global' | 'type' = escalateGlobal || !context.typeId ? 'global' : 'type';
+
+  try {
+    await recordUnsubscribe(context, email, scope);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(JSON.stringify({ level: 'error', msg: 'unsubscribe-failed', email, campaignId, err: msg }));
     return html(500, errorPage('Sorry — something went wrong. Try again, or reply to the email.'));
   }
 
-  if (event.httpMethod === 'POST') {
+  if (event.httpMethod === 'POST' && !escalateGlobal) {
     // RFC 8058 one-click — mail clients want a 200 with no body.
     return { statusCode: 200, headers: { 'content-type': 'text/plain' }, body: 'OK' };
   }
+
   const settings = await loadSettings().catch(() => ({ footerHtml: '' } as OrgSettings));
-  return html(200, confirmationPage(email, settings));
+  return html(
+    200,
+    confirmationPage({
+      email,
+      settings,
+      context,
+      scope,
+      token,
+    }),
+  );
 };
 
-async function recordUnsubscribe(campaignId: string, email: string): Promise<void> {
+async function recordUnsubscribe(
+  context: CampaignContext,
+  email: string,
+  scope: 'global' | 'type',
+): Promise<void> {
   const at = new Date().toISOString();
-  const suppression = suppressionState('unsubscribe', at);
-  await Promise.all([
-    ddb.send(
-      new PutCommand({
-        TableName: TABLE,
-        Item: {
-          PK: `SUPP#${email}`,
-          SK: 'REASON#unsubscribe',
-          email,
-          reason: 'unsubscribe',
-          source: 'link',
-          campaignId,
-          addedAt: at,
-        },
-      }),
-    ),
-    ddb.send(
+  await applySuppression(ddb, TABLE, {
+    email,
+    scope,
+    typeId: scope === 'type' ? context.typeId : undefined,
+    reason: 'unsubscribe',
+    source: 'link',
+    campaignId: context.campaignId,
+    at,
+  });
+
+  // For the global path we also flip the contact's status to `unsubscribed`
+  // and refresh the GSI2 partition. Per-type opt-outs leave the contact
+  // active for sends from other types.
+  if (scope === 'global') {
+    await ddb.send(
       new UpdateCommand({
         TableName: TABLE,
         Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' },
         UpdateExpression:
-          'SET #s = :s, unsubscribedAt = :u, updatedAt = :u, suppressed = :suppressed, suppressedAt = :suppressedAt, suppressionReason = :suppressionReason, GSI2PK = :gsi2pk, GSI2SK = :gsi2sk',
+          'SET #s = :s, unsubscribedAt = :u, updatedAt = :u, suppressedAt = :u, suppressionReason = :r, GSI2PK = :gsi2pk, GSI2SK = :gsi2sk',
         ConditionExpression: 'attribute_exists(PK)',
         ExpressionAttributeNames: { '#s': 'status' },
         ExpressionAttributeValues: {
           ':s': 'unsubscribed',
           ':u': at,
-          ':suppressed': suppression.suppressed,
-          ':suppressedAt': suppression.suppressedAt,
-          ':suppressionReason': suppression.suppressionReason,
+          ':r': 'unsubscribe',
           ':gsi2pk': contactStatusIndexFields(email, 'unsubscribed').GSI2PK,
           ':gsi2sk': contactStatusIndexFields(email, 'unsubscribed').GSI2SK,
         },
       }),
-    ).catch(() => { /* contact may not exist in our table (forwarded mail) */ }),
+    ).catch(() => { /* contact may not exist (forwarded mail) */ });
+  }
+
+  await Promise.all([
     ddb.send(
       new UpdateCommand({
         TableName: TABLE,
-        Key: { PK: `CAMPAIGN#${campaignId}`, SK: 'STATS' },
+        Key: { PK: `CAMPAIGN#${context.campaignId}`, SK: 'STATS' },
         UpdateExpression: 'ADD unsubscribed :one',
         ExpressionAttributeValues: { ':one': 1 },
       }),
@@ -125,7 +185,7 @@ async function recordUnsubscribe(campaignId: string, email: string): Promise<voi
     ddb.send(
       new UpdateCommand({
         TableName: TABLE,
-        Key: { PK: `CAMPAIGN#${campaignId}`, SK: `RCPT#${email}` },
+        Key: { PK: `CAMPAIGN#${context.campaignId}`, SK: `RCPT#${email}` },
         UpdateExpression: 'SET #s = :s, unsubscribedAt = :u',
         ExpressionAttributeNames: { '#s': 'state' },
         ExpressionAttributeValues: { ':s': 'unsubscribed', ':u': at },
@@ -138,8 +198,46 @@ function verifyToken(campaignId: string, email: string, token: string): boolean 
   return verifyUnsubscribeToken(UNSUB_SECRET, campaignId, email, token);
 }
 
-function confirmationPage(email: string, settings: OrgSettings): string {
-  const footerLine = senderFooterLine(settings);
+interface ConfirmationOpts {
+  email: string;
+  settings: OrgSettings;
+  context: CampaignContext;
+  scope: 'global' | 'type';
+  token: string;
+}
+
+function confirmationPage(opts: ConfirmationOpts): string {
+  const footerLine = senderFooterLine(opts.settings);
+  const typeLabel = opts.context.typeName ? escapeHtml(opts.context.typeName) : 'this newsletter';
+  const brandLabel = opts.settings.senderName
+    ? escapeHtml(opts.settings.senderName)
+    : 'this sender';
+
+  const headline =
+    opts.scope === 'global'
+      ? "You've been unsubscribed from all emails"
+      : `You've been unsubscribed from ${typeLabel}`;
+
+  const detail =
+    opts.scope === 'global'
+      ? `<code>${escapeHtml(opts.email)}</code> will no longer receive any newsletters from us.`
+      : `<code>${escapeHtml(opts.email)}</code> has been removed from <strong>${typeLabel}</strong>. Other newsletters you're subscribed to will keep arriving.`;
+
+  // Only show the escalate-to-global form when we just processed a per-type
+  // unsubscribe. After someone has globally opted out, the form is redundant.
+  const escalateAction =
+    `?c=${encodeURIComponent(opts.context.campaignId)}` +
+    `&e=${encodeURIComponent(opts.email)}` +
+    `&t=${encodeURIComponent(opts.token)}&scope=all`;
+  const escalateBlock =
+    opts.scope === 'type'
+      ? `
+        <form method="POST" action="${escapeHtml(escalateAction)}" class="escalate">
+          <p>Want to stop all emails from ${brandLabel}, not just ${typeLabel}?</p>
+          <button type="submit" class="link">Unsubscribe from everything</button>
+        </form>`
+      : '';
+
   return `<!doctype html><html lang="en"><head><meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Unsubscribed</title>
@@ -149,12 +247,18 @@ function confirmationPage(email: string, settings: OrgSettings): string {
     h1{font-size:24px;margin:0 0 12px;letter-spacing:-.01em}
     p{font-size:15px;line-height:1.6;color:#554a40;margin:8px 0}
     code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#f4efe5;padding:2px 6px;border-radius:3px;font-size:13px}
+    strong{color:#2a2420}
     .muted{color:#8a7f70;font-size:13px;margin-top:22px;border-top:1px solid #e6decf;padding-top:14px;white-space:pre-line}
+    form.escalate{margin-top:18px;padding-top:14px;border-top:1px solid #e6decf}
+    form.escalate p{font-size:13px;color:#8a7f70;margin:0 0 8px}
+    button.link{font:inherit;font-size:13px;color:#9b3b21;background:none;border:none;padding:0;cursor:pointer;text-decoration:underline}
+    button.link:hover{color:#7a2d18}
   </style></head>
   <body><div class="card">
-    <h1>You've been unsubscribed</h1>
-    <p><code>${escapeHtml(email)}</code> has been removed from future mailings.</p>
+    <h1>${escapeHtml(headline)}</h1>
+    <p>${detail}</p>
     <p>If this was a mistake, reply to any recent dispatch and we'll restore you.</p>
+    ${escalateBlock}
     ${footerLine ? `<p class="muted">${footerLine}</p>` : ''}
   </div></body></html>`;
 }
