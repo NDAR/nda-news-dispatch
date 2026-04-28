@@ -9,6 +9,7 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import {
   applySuppression,
+  contactStatusIndexFields,
   parseSuppressionSk,
   removeAllSuppressions,
   removeSuppression as removeOneSuppression,
@@ -212,14 +213,42 @@ async function refreshContactAfterDelete(email: string): Promise<void> {
   const at = new Date().toISOString();
 
   if (!stillSuppressed) {
+    // Also restore the contact's status / GSI2 partition if it was flipped
+    // to `unsubscribed` or `bounced` when the suppression was first applied.
+    // Without this, the subscribers list keeps showing the contact as
+    // "unsubscribed" after the SUPP row is gone.
+    const profile = await ddb.send(
+      new GetCommand({
+        TableName: TABLE,
+        Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' },
+        ProjectionExpression: '#s',
+        ExpressionAttributeNames: { '#s': 'status' },
+      }),
+    ).catch(() => null);
+    const currentStatus = profile?.Item?.status;
+    const restoreActive = currentStatus === 'unsubscribed' || currentStatus === 'bounced';
+    const sets = ['suppressedGlobal = :false', 'suppressed = :false', 'updatedAt = :u'];
+    const removes = ['suppressedTypes', 'suppressedAt', 'suppressionReason'];
+    const values: Record<string, unknown> = { ':false': false, ':u': at };
+    const names: Record<string, string> = {};
+    if (restoreActive) {
+      const idx = contactStatusIndexFields(email, 'active');
+      sets.push('#s = :active', 'GSI2PK = :gsi2pk', 'GSI2SK = :gsi2sk');
+      removes.push('unsubscribedAt', 'bouncedAt');
+      names['#s'] = 'status';
+      values[':active'] = 'active';
+      values[':gsi2pk'] = idx.GSI2PK;
+      values[':gsi2sk'] = idx.GSI2SK;
+    }
+    const expr = 'SET ' + sets.join(', ') + ' REMOVE ' + removes.join(', ');
     await ddb.send(
       new UpdateCommand({
         TableName: TABLE,
         Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' },
-        UpdateExpression:
-          'SET suppressedGlobal = :false, suppressed = :false, updatedAt = :u REMOVE suppressedTypes, suppressedAt, suppressionReason',
+        UpdateExpression: expr,
         ConditionExpression: 'attribute_exists(PK)',
-        ExpressionAttributeValues: { ':false': false, ':u': at },
+        ExpressionAttributeNames: Object.keys(names).length > 0 ? names : undefined,
+        ExpressionAttributeValues: values,
       }),
     ).catch(() => undefined);
     return;

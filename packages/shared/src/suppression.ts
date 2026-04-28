@@ -1,10 +1,12 @@
 import {
   DynamoDBDocumentClient,
   DeleteCommand,
+  GetCommand,
   PutCommand,
   QueryCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
+import { contactStatusIndexFields } from './contact-model';
 
 /**
  * Suppression scope.
@@ -307,17 +309,48 @@ async function clearContactSuppressionFlags(
   tableName: string,
   email: string,
 ): Promise<void> {
+  // When a global unsubscribe lands we also flip the contact's status to
+  // `unsubscribed` (or `bounced`) and migrate the row's GSI2 partition.
+  // Reversing the suppression has to undo BOTH of those — otherwise the
+  // operator sees the SUPP row gone but the contact still showing as
+  // unsubscribed in the subscribers list, and the audience filter still
+  // won't include them.
+  const profile = await ddb.send(
+    new GetCommand({
+      TableName: tableName,
+      Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' },
+      ProjectionExpression: '#s',
+      ExpressionAttributeNames: { '#s': 'status' },
+    }),
+  ).catch(() => null);
+  const currentStatus = profile?.Item?.status;
+  const restoreActive = currentStatus === 'unsubscribed' || currentStatus === 'bounced';
+
+  const sets = ['suppressedGlobal = :false', 'suppressed = :false', 'updatedAt = :u'];
+  const removes = ['suppressedTypes', 'suppressedAt', 'suppressionReason'];
+  const values: Record<string, unknown> = {
+    ':false': false,
+    ':u': new Date().toISOString(),
+  };
+  const names: Record<string, string> = {};
+  if (restoreActive) {
+    const idx = contactStatusIndexFields(email, 'active');
+    sets.push('#s = :active', 'GSI2PK = :gsi2pk', 'GSI2SK = :gsi2sk');
+    removes.push('unsubscribedAt', 'bouncedAt');
+    names['#s'] = 'status';
+    values[':active'] = 'active';
+    values[':gsi2pk'] = idx.GSI2PK;
+    values[':gsi2sk'] = idx.GSI2SK;
+  }
+  const expr = 'SET ' + sets.join(', ') + ' REMOVE ' + removes.join(', ');
   await ddb.send(
     new UpdateCommand({
       TableName: tableName,
       Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' },
-      UpdateExpression:
-        'SET suppressedGlobal = :false, suppressed = :false, updatedAt = :u REMOVE suppressedTypes, suppressedAt, suppressionReason',
+      UpdateExpression: expr,
       ConditionExpression: 'attribute_exists(PK)',
-      ExpressionAttributeValues: {
-        ':false': false,
-        ':u': new Date().toISOString(),
-      },
+      ExpressionAttributeNames: Object.keys(names).length > 0 ? names : undefined,
+      ExpressionAttributeValues: values,
     }),
   ).catch(() => undefined);
 }
