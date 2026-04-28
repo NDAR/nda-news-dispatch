@@ -156,6 +156,34 @@ Three defenses, applied unconditionally:
    also dropped. Both filters fail open if the RCPT row is missing so
    legitimate engagement is never silently lost.
 
+### Public subscribe page
+
+A linkable, unauthenticated sign-up form lives at
+`https://<your-domain>/subscribe` (or `/subscribe?type=<typeId>` to
+preselect a newsletter). The Settings page in the SPA lists the
+copy-paste URLs for the generic form and each active type. Submissions
+are double opt-in: the form writes a `PENDING_OPTIN#<email>` row with a
+48 h DDB TTL and emails an HMAC-signed confirmation link; only on click
+does the contact land on the active list.
+
+Bot resistance, layered:
+
+1. **Honeypot field.** A hidden `website` input — bots that auto-fill
+   every field trip it; the response looks like success so they don't
+   probe further.
+2. **WAF rate limit.** 60 sign-ups / 5 min / IP on `/public/subscribe`,
+   on top of the existing `/public/*` cap.
+3. **Cloudflare Turnstile (optional).** Set `VITE_TURNSTILE_SITE_KEY`
+   for the SPA build and `TURNSTILE_SECRET` on the `SubscribeFn`
+   Lambda env to add an invisible challenge. Without these, the form
+   still works on the other three layers.
+4. **Double opt-in confirmation email.** Bots that beat 1–3 still need
+   to click the link sent to the address they typed — which won't
+   happen unless they own the inbox.
+5. **Suppression check.** Globally-suppressed addresses are silently
+   swallowed at submission time so the endpoint can't be used to probe
+   the suppression list.
+
 ### Repo layout
 
 ```

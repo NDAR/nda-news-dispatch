@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useEditor, EditorContent, type Editor } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Link from '@tiptap/extension-link';
-import { getSettings, updateSettings, type OrgSettings } from '../api/endpoints';
+import { getSettings, listTypes, updateSettings, type OrgSettings } from '../api/endpoints';
 import { renderFooterPreviewHtml } from '../lib/footerPreview';
 import { buildPreviewSrcDoc } from '../lib/previewFrame';
 
@@ -178,6 +178,97 @@ function SettingsPage() {
             </p>
           )}
         </div>
+      </div>
+
+      <SubscribeLinksCard />
+    </div>
+  );
+}
+
+function SubscribeLinksCard() {
+  const { data } = useQuery({ queryKey: ['types'], queryFn: () => listTypes() });
+  const types = (data ?? []).filter((t) => !t.archived);
+  const origin = typeof window !== 'undefined' ? window.location.origin : '';
+  const baseUrl = `${origin}/subscribe`;
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <div>
+          <div className="eyebrow">Workspace</div>
+          <h3 className="serif mt-sm">Public subscribe links</h3>
+          <p className="muted" style={{ marginTop: 4, fontSize: 13 }}>
+            Share these URLs anywhere — landing pages, social bios, email
+            sigs. Each visitor enters their email, clicks the confirmation
+            link we send them, and lands on the active subscriber list.
+            Bots are filtered with a honeypot field, a per-IP rate limit,
+            and the double opt-in confirmation step. Set
+            <code> VITE_TURNSTILE_SITE_KEY</code> + <code>TURNSTILE_SECRET</code>{' '}
+            to add an invisible Cloudflare Turnstile challenge.
+          </p>
+        </div>
+      </div>
+      <div className="card-body stack" style={{ gap: 14 }}>
+        <UrlRow label="Generic — chooser shown" url={baseUrl} />
+        {types.length > 0 && (
+          <div className="stack" style={{ gap: 6 }}>
+            <label className="eyebrow">Per newsletter type</label>
+            <div className="stack" style={{ gap: 8 }}>
+              {types.map((t) => (
+                <UrlRow
+                  key={t.id}
+                  label={t.name}
+                  url={`${baseUrl}?type=${encodeURIComponent(t.id)}`}
+                />
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function UrlRow({ label, url }: { label: string; url: string }) {
+  const [copied, setCopied] = useState(false);
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard API blocked — fall back to selecting the input below.
+    }
+  };
+  return (
+    <div className="stack" style={{ gap: 4 }}>
+      <label className="eyebrow">{label}</label>
+      <div className="row items-center gap-sm">
+        <input
+          type="text"
+          value={url}
+          readOnly
+          onFocus={(e) => e.currentTarget.select()}
+          className="input mono-sm"
+          style={{ flex: 1, fontSize: 12 }}
+        />
+        <button
+          type="button"
+          className="btn btn-sm btn-ghost"
+          onClick={onCopy}
+          title="Copy to clipboard"
+        >
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="btn btn-sm btn-ghost"
+          title="Open in a new tab"
+        >
+          Open
+        </a>
       </div>
     </div>
   );
