@@ -1,9 +1,11 @@
 import type { APIGatewayProxyHandler, APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
+  DeleteCommand,
   DynamoDBDocumentClient,
   GetCommand,
   ScanCommand,
+  UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import {
   applySuppression,
@@ -55,6 +57,11 @@ interface SuppressionInput {
 
 interface SuppressionListItem {
   email: string;
+  /** Echo the actual SK so the DELETE can target this exact row. Without
+   *  it, legacy `REASON#…` rows are visible in the list (they map to
+   *  scope=global) but the canonical-SK delete (`TYPE#GLOBAL`) silently
+   *  no-ops on them, leaving the row visible after "Remove". */
+  sk: string;
   scope: SuppressionScope;
   typeId?: string;
   typeName?: string;
@@ -130,6 +137,24 @@ async function deleteSuppression(event: APIGatewayProxyEvent): Promise<{ email: 
   const email = decodeEmail(event);
   const qs = event.queryStringParameters ?? {};
   const scopeRaw = (qs.scope ?? '').toLowerCase();
+  const skRaw = qs.sk ? String(qs.sk) : '';
+
+  // Targeted exact-SK delete. Used by the SPA — the row carries its own
+  // SK via the list endpoint, so a legacy `REASON#bounce` row is deleted
+  // by its real SK rather than by the canonical scope SK (which would
+  // no-op for legacy rows and leave them in the list).
+  if (skRaw && (skRaw.startsWith('TYPE#') || skRaw.startsWith('REASON#'))) {
+    await ddb.send(
+      new DeleteCommand({
+        TableName: TABLE,
+        Key: { PK: `SUPP#${email}`, SK: skRaw },
+      }),
+    );
+    // Re-derive the contact denorm hints from whatever rows remain.
+    await refreshContactAfterDelete(email);
+    return { email, removed: 1 };
+  }
+
   if (scopeRaw === 'all') {
     const removed = await removeAllSuppressions(ddb, TABLE, email);
     return { email, removed };
@@ -153,6 +178,78 @@ async function deleteSuppression(event: APIGatewayProxyEvent): Promise<{ email: 
   return { email, removed };
 }
 
+/**
+ * Mirror of removeSuppression's denorm refresh, but invoked after we've
+ * already deleted by exact SK. Walks the remaining SUPP#<email> rows and
+ * rewrites suppressedGlobal / suppressedTypes / the legacy `suppressed`
+ * boolean accordingly. Idempotent.
+ */
+async function refreshContactAfterDelete(email: string): Promise<void> {
+  // We re-implement the small read+write here rather than re-export
+  // private helpers from the shared module — keeps the shared API tight.
+  const remaining = await ddb.send(
+    new ScanCommand({
+      TableName: TABLE,
+      FilterExpression: 'PK = :pk AND (begins_with(SK, :tsk) OR begins_with(SK, :rsk))',
+      ExpressionAttributeValues: {
+        ':pk': `SUPP#${email}`,
+        ':tsk': 'TYPE#',
+        ':rsk': 'REASON#',
+      },
+    }),
+  );
+  let hasGlobal = false;
+  const types: string[] = [];
+  for (const row of remaining.Items ?? []) {
+    const sk = String(row.SK ?? '');
+    const parsed = parseSuppressionSk(sk);
+    if (!parsed) continue;
+    if (parsed.scope === 'global') hasGlobal = true;
+    if (parsed.scope === 'type' && parsed.typeId) types.push(parsed.typeId);
+  }
+
+  const stillSuppressed = hasGlobal || types.length > 0;
+  const at = new Date().toISOString();
+
+  if (!stillSuppressed) {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' },
+        UpdateExpression:
+          'SET suppressedGlobal = :false, suppressed = :false, updatedAt = :u REMOVE suppressedTypes, suppressedAt, suppressionReason',
+        ConditionExpression: 'attribute_exists(PK)',
+        ExpressionAttributeValues: { ':false': false, ':u': at },
+      }),
+    ).catch(() => undefined);
+    return;
+  }
+
+  const sets: string[] = ['suppressedGlobal = :g', 'suppressed = :true', 'updatedAt = :u'];
+  const removes: string[] = [];
+  const values: Record<string, unknown> = {
+    ':g': hasGlobal,
+    ':true': true,
+    ':u': at,
+  };
+  if (types.length > 0) {
+    sets.push('suppressedTypes = :tset');
+    values[':tset'] = new Set(types);
+  } else {
+    removes.push('suppressedTypes');
+  }
+  const expr = 'SET ' + sets.join(', ') + (removes.length > 0 ? ' REMOVE ' + removes.join(', ') : '');
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' },
+      UpdateExpression: expr,
+      ConditionExpression: 'attribute_exists(PK)',
+      ExpressionAttributeValues: values,
+    }),
+  ).catch(() => undefined);
+}
+
 async function mapSuppressionItem(item: Record<string, unknown>): Promise<SuppressionListItem | null> {
   const email = String(item.email ?? '');
   const sk = String(item.SK ?? '');
@@ -163,6 +260,7 @@ async function mapSuppressionItem(item: Record<string, unknown>): Promise<Suppre
     : undefined;
   return {
     email,
+    sk,
     scope: parsed.scope,
     typeId: parsed.typeId,
     typeName,

@@ -89,13 +89,15 @@ function SubscribersPage() {
   const removeSuppMut = useMutation({
     mutationFn: ({
       email,
+      sk,
       scope,
       typeId,
     }: {
       email: string;
+      sk?: string;
       scope: SuppressionScope | 'all';
       typeId?: string;
-    }) => removeSuppression(email, { scope, typeId }),
+    }) => removeSuppression(email, { sk, scope, typeId }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['suppressions'] }),
   });
 
@@ -262,6 +264,7 @@ function SubscribersPage() {
                 ) {
                   removeSuppMut.mutate({
                     email: s.email,
+                    sk: s.sk,
                     scope: s.scope,
                     typeId: s.typeId,
                   });
@@ -269,7 +272,7 @@ function SubscribersPage() {
               }}
               removingKey={
                 removeSuppMut.isPending && removeSuppMut.variables
-                  ? `${removeSuppMut.variables.email}|${removeSuppMut.variables.scope}|${removeSuppMut.variables.typeId ?? ''}`
+                  ? `${removeSuppMut.variables.email}|${removeSuppMut.variables.sk ?? ''}`
                   : undefined
               }
             />
@@ -510,7 +513,7 @@ function SuppressionsPanel({
               </thead>
               <tbody>
                 {items.map((s) => {
-                  const rowKey = `${s.email}|${s.scope}|${s.typeId ?? ''}`;
+                  const rowKey = `${s.email}|${s.sk}`;
                   return (
                     <tr key={rowKey}>
                       <td className="mono-sm">{s.email}</td>

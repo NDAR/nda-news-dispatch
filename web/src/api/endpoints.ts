@@ -328,6 +328,9 @@ export type SuppressionScope = 'global' | 'type';
 
 export interface Suppression {
   email: string;
+  /** Real DDB sort key for this row. Pass back on DELETE so the server can
+   *  delete this exact row even if it's a legacy `REASON#…` shape. */
+  sk: string;
   scope: SuppressionScope;
   /** Newsletter type id when scope is "type". */
   typeId?: string;
@@ -367,13 +370,19 @@ export const addSuppression = (
     { method: 'POST', body: JSON.stringify(input) },
   );
 
-/** Removes one scoped suppression row. With no scope, removes every SUPP row
- *  for the email — preserves the legacy "delete all" UX from the Global tab. */
+/** Removes a scoped suppression row.
+ *
+ * Prefer passing the full `sk` from the listed Suppression — it lets the
+ * server delete the exact row, including legacy `REASON#…` shapes, instead
+ * of computing a canonical SK from the scope (which would silently no-op
+ * on legacy rows). With no `sk` and no scope, removes every SUPP row for
+ * the email. */
 export const removeSuppression = (
   email: string,
-  opts: { scope?: SuppressionScope | 'all'; typeId?: string } = {},
+  opts: { sk?: string; scope?: SuppressionScope | 'all'; typeId?: string } = {},
 ) => {
   const qs = new URLSearchParams();
+  if (opts.sk) qs.set('sk', opts.sk);
   if (opts.scope) qs.set('scope', opts.scope);
   if (opts.typeId) qs.set('typeId', opts.typeId);
   const s = qs.toString();
