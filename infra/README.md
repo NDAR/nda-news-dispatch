@@ -7,7 +7,7 @@ configurable via `-c region=…`.
 
 | Stack | Purpose |
 |---|---|
-| `NdaDispatch-<env>-Auth` | Cognito User Pool + Hosted UI domain + SPA app client (auth code flow + PKCE, 12-char password policy, required TOTP MFA (SMS disabled)). |
+| `NdaDispatch-<env>-Auth` | Cognito User Pool + Hosted UI domain + SPA app client (auth code flow + PKCE, 12-char password policy, required TOTP MFA in prod (off in dev), SMS disabled). |
 | `NdaDispatch-<env>-Storage` | S3 buckets: `spa` (static SPA bundle), `archive` (rendered HTML + uploaded asset images). |
 | `NdaDispatch-<env>-Data` | DynamoDB single table (`nda-dispatch-<env>`) with GSI1 + GSI2, streams, PITR, TTL. SQS `send` queue (per-recipient SES jobs) + DLQ. SQS `enqueue` queue (one-message-per-campaign fan-out trigger) + DLQ. `unsubscribeSecret` in Secrets Manager (HMAC key for unsubscribe + view-in-browser tokens). |
 | `NdaDispatch-<env>-Processing` | S3 `imports/*.csv` PUT → SQS `import` → `worker-import` Lambda. Parses CSV (quote-aware), checks suppressions, upserts contacts + tag index items, updates the `IMPORT#<id>` record with counts and status. |

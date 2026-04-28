@@ -41,7 +41,10 @@ export class AuthStack extends Stack {
         requireSymbols: true,
         tempPasswordValidity: Duration.days(3),
       },
-      mfa: Mfa.REQUIRED,
+      // MFA is enforced in prod and disabled in dev so iterating on the
+      // admin UI doesn't constantly hit a TOTP challenge. SMS stays off in
+      // both — TOTP is the only second factor we accept.
+      mfa: config.envName === 'prod' ? Mfa.REQUIRED : Mfa.OFF,
       mfaSecondFactor: { sms: false, otp: true },
       accountRecovery: AccountRecovery.EMAIL_ONLY,
       advancedSecurityMode: AdvancedSecurityMode.AUDIT,
