@@ -104,6 +104,11 @@ function CampaignDetailPage() {
               </>
             )}
           </div>
+          <AudienceTagsRow
+            tags={data.tags}
+            excludeTags={data.excludeTags}
+            tagMode={data.tagMode}
+          />
         </div>
         <div className="row gap-sm" style={{ flexShrink: 0 }}>
           <button className="btn btn-sm" onClick={() => setContentOpen(true)}>
@@ -555,4 +560,72 @@ function exportCsv(campaign: Campaign, rcpts: CampaignRecipient[]) {
 function csvEscape(v: string): string {
   if (/[",\n]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
   return v;
+}
+
+/**
+ * Renders the include/exclude tag selection that targeted this campaign.
+ * Skips entirely when neither include nor exclude tags are set so it doesn't
+ * leave a dangling label on legacy or "everyone" sends.
+ */
+function AudienceTagsRow({
+  tags,
+  excludeTags,
+  tagMode,
+}: {
+  tags: string[];
+  excludeTags: string[];
+  tagMode: 'all' | 'any';
+}) {
+  const hasInc = tags.length > 0;
+  const hasExc = excludeTags.length > 0;
+  if (!hasInc && !hasExc) return null;
+  return (
+    <div className="muted mt-sm" style={{ fontSize: 13, lineHeight: 1.6 }}>
+      <span className="eyebrow" style={{ marginRight: 8 }}>Audience</span>
+      {hasInc && (
+        <>
+          <span style={{ marginRight: 6 }}>
+            {tagMode === 'all' ? 'matches all of' : 'matches any of'}
+          </span>
+          <TagChips tags={tags} />
+        </>
+      )}
+      {hasExc && (
+        <>
+          {hasInc && <span style={{ margin: '0 8px' }}>·</span>}
+          <span style={{ marginRight: 6 }}>excluding</span>
+          <TagChips tags={excludeTags} variant="exclude" />
+        </>
+      )}
+    </div>
+  );
+}
+
+function TagChips({
+  tags,
+  variant = 'include',
+}: {
+  tags: string[];
+  variant?: 'include' | 'exclude';
+}) {
+  return (
+    <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 4, verticalAlign: 'middle' }}>
+      {tags.map((t) => (
+        <span
+          key={t}
+          className="mono-sm"
+          style={{
+            fontSize: 11,
+            padding: '1px 7px',
+            borderRadius: 999,
+            border: '1px solid var(--rule-soft, #e5e5e5)',
+            background: variant === 'exclude' ? 'oklch(96% 0.03 30)' : 'var(--paper-deep, #f4efe5)',
+            color: variant === 'exclude' ? 'oklch(35% 0.12 30)' : 'var(--ink-soft, #2a2420)',
+          }}
+        >
+          #{t}
+        </span>
+      ))}
+    </span>
+  );
 }

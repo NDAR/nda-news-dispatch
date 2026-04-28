@@ -437,6 +437,11 @@ function CampaignRow({
         <div className="muted" style={{ fontSize: 11.5, marginTop: 2 }}>
           {c.subject || <em className="faint">(no subject)</em>}
         </div>
+        <CompactAudienceTags
+          tags={c.tags}
+          excludeTags={c.excludeTags}
+          tagMode={c.tagMode}
+        />
       </td>
       <td className="mono-sm muted">
         {isSent && c.sentAt ? (
@@ -501,6 +506,62 @@ function CampaignRow({
 function rate(num: number | undefined, den: number | undefined): number {
   if (!den) return 0;
   return (num ?? 0) / den;
+}
+
+/**
+ * One-line summary of the include/exclude tags used to target a campaign.
+ * Compact enough for a table cell — strikethrough on excluded tags so the
+ * include/exclude split reads at a glance without a separate label. Hidden
+ * entirely when no tags were used (everyone-send).
+ */
+function CompactAudienceTags({
+  tags,
+  excludeTags,
+  tagMode,
+}: {
+  tags: string[];
+  excludeTags: string[];
+  tagMode: 'all' | 'any';
+}) {
+  if (tags.length === 0 && excludeTags.length === 0) return null;
+  return (
+    <div
+      className="muted"
+      style={{ fontSize: 11, marginTop: 4, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 4 }}
+    >
+      {tags.length > 0 && (
+        <span
+          className="mono-sm faint"
+          style={{ fontSize: 10, marginRight: 2 }}
+          title={tagMode === 'all' ? 'Recipient must have ALL of these tags' : 'Recipient must have ANY of these tags'}
+        >
+          {tagMode === 'all' ? 'all of' : 'any of'}
+        </span>
+      )}
+      {tags.map((t) => (
+        <span key={t} className="mono-sm" style={chipStyle()}>#{t}</span>
+      ))}
+      {excludeTags.length > 0 && (
+        <span className="mono-sm faint" style={{ fontSize: 10, marginLeft: tags.length > 0 ? 4 : 0, marginRight: 2 }}>
+          except
+        </span>
+      )}
+      {excludeTags.map((t) => (
+        <span key={t} className="mono-sm" style={chipStyle('exclude')}>#{t}</span>
+      ))}
+    </div>
+  );
+}
+
+function chipStyle(variant: 'include' | 'exclude' = 'include'): React.CSSProperties {
+  return {
+    fontSize: 10.5,
+    padding: '1px 6px',
+    borderRadius: 999,
+    border: '1px solid var(--rule-soft, #e5e5e5)',
+    background: variant === 'exclude' ? 'oklch(96% 0.03 30)' : 'var(--paper-deep, #f4efe5)',
+    color: variant === 'exclude' ? 'oklch(35% 0.12 30)' : 'var(--ink-soft, #2a2420)',
+  };
 }
 
 function SortHeader({
