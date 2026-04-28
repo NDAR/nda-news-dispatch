@@ -91,7 +91,9 @@ async function listPublicTypes(): Promise<{ items: PublicType[] }> {
     }),
   );
   const items = (res.Items ?? [])
-    .filter((it: Record<string, unknown>) => it.archived !== true)
+    .filter((it: Record<string, unknown>) =>
+      it.archived !== true && it.publicSubscribable === true,
+    )
     .map((it: Record<string, unknown>) => ({
       id: String(it.id ?? ''),
       name: String(it.name ?? ''),
@@ -146,11 +148,13 @@ async function postSubscribe(event: APIGatewayProxyEvent): Promise<{ ok: true; p
 
   if (typeId) {
     // Validate the typeId against the actual types so an attacker can't
-    // create stray PENDING rows for arbitrary strings. Cheap: one GetItem.
+    // create stray PENDING rows for arbitrary strings, AND require that
+    // the type was opted in for public sign-up — admins explicitly mark
+    // which types accept self-service subscribers.
     const t = await ddb.send(
       new GetCommand({ TableName: TABLE, Key: { PK: `TYPE#${typeId}`, SK: 'LATEST' } }),
     ).catch(() => null);
-    if (!t?.Item || t.Item.archived === true) {
+    if (!t?.Item || t.Item.archived === true || t.Item.publicSubscribable !== true) {
       throw new HttpError(404, 'type-not-found', 'That newsletter is no longer available.');
     }
   }

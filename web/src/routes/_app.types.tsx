@@ -91,6 +91,22 @@ function TypesList() {
                     <div className="row items-center gap-sm">
                       <span className="serif" style={{ fontSize: 16 }}>{t.name}</span>
                       <TypePill type={t} />
+                      {t.publicSubscribable && (
+                        <span
+                          title="Visitors can self-subscribe to this type via the public /subscribe page"
+                          style={{
+                            fontSize: 10,
+                            padding: '2px 8px',
+                            borderRadius: 999,
+                            background: 'oklch(95% 0.05 145)',
+                            color: 'oklch(35% 0.1 145)',
+                            fontWeight: 600,
+                            letterSpacing: 0.2,
+                          }}
+                        >
+                          Public sign-up
+                        </span>
+                      )}
                       {t.defaultBodyHtml && (
                         <span
                           className="mono-sm muted"

@@ -187,7 +187,9 @@ function SettingsPage() {
 
 function SubscribeLinksCard() {
   const { data } = useQuery({ queryKey: ['types'], queryFn: () => listTypes() });
-  const types = (data ?? []).filter((t) => !t.archived);
+  // Only types explicitly opted in for public sign-ups should be linkable;
+  // sharing a URL for an invite-only type would surface a 404 to the visitor.
+  const types = (data ?? []).filter((t) => !t.archived && t.publicSubscribable);
   const origin = typeof window !== 'undefined' ? window.location.origin : '';
   const baseUrl = `${origin}/subscribe`;
 
@@ -209,8 +211,17 @@ function SubscribeLinksCard() {
         </div>
       </div>
       <div className="card-body stack" style={{ gap: 14 }}>
-        <UrlRow label="Generic — chooser shown" url={baseUrl} />
-        {types.length > 0 && (
+        <UrlRow
+          label={
+            types.length > 1
+              ? 'Generic — chooser shown'
+              : types.length === 1
+                ? `Generic — auto-selects "${types[0].name}"`
+                : 'Generic'
+          }
+          url={baseUrl}
+        />
+        {types.length > 1 && (
           <div className="stack" style={{ gap: 6 }}>
             <label className="eyebrow">Per newsletter type</label>
             <div className="stack" style={{ gap: 8 }}>
@@ -223,6 +234,13 @@ function SubscribeLinksCard() {
               ))}
             </div>
           </div>
+        )}
+        {types.length === 0 && (
+          <p className="muted" style={{ fontSize: 12 }}>
+            No newsletter types are marked <strong>Allow public sign-ups</strong> yet.
+            The page above will show a "subscriptions are currently closed" notice
+            until at least one type is opted in.
+          </p>
         )}
       </div>
     </div>

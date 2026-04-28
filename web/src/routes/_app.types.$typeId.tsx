@@ -37,6 +37,7 @@ function TypeEditPage() {
   const [defaultTagsRaw, setDefaultTagsRaw] = useState('');
   const [defaultSubjectPrefix, setDefaultSubjectPrefix] = useState('');
   const [defaultBodyHtml, setDefaultBodyHtml] = useState('');
+  const [publicSubscribable, setPublicSubscribable] = useState(false);
   const [tagWarning, setTagWarning] = useState<string | null>(null);
   const [editorMode, setEditorMode] = useState<'visual' | 'code'>('visual');
   const seededRef = useRef(false);
@@ -63,6 +64,7 @@ function TypeEditPage() {
       setDefaultTagsRaw(existing.defaultTags.join(', '));
       setDefaultSubjectPrefix(existing.defaultSubjectPrefix ?? '');
       setDefaultBodyHtml(existing.defaultBodyHtml ?? '');
+      setPublicSubscribable(existing.publicSubscribable === true);
       editor.commands.setContent(existing.defaultBodyHtml || '<p></p>', { emitUpdate: false });
     }
   }, [editor, existing, isNew]);
@@ -104,6 +106,7 @@ function TypeEditPage() {
       defaultTags: tags,
       defaultSubjectPrefix: defaultSubjectPrefix.trim() || undefined,
       defaultBodyHtml: cleanedHtml || undefined,
+      publicSubscribable,
     });
   }
 
@@ -223,6 +226,23 @@ function TypeEditPage() {
               {tagWarning && (
                 <div style={{ color: 'var(--bad)', fontSize: 11, marginTop: 4 }}>{tagWarning}</div>
               )}
+            </div>
+            <div>
+              <label
+                className="row items-center gap-sm"
+                style={{ cursor: 'pointer', fontSize: 13 }}
+              >
+                <input
+                  type="checkbox"
+                  checked={publicSubscribable}
+                  onChange={(e) => setPublicSubscribable(e.target.checked)}
+                />
+                <span>Allow public sign-ups</span>
+              </label>
+              <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+                When enabled, this type is shown on the public /subscribe page
+                so visitors can self-subscribe. Disabled types stay invite-only.
+              </div>
             </div>
           </div>
         </div>

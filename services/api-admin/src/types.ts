@@ -52,6 +52,10 @@ interface TypeInput {
   defaultSubjectPrefix?: string;
   /** Optional HTML body that seeds new newsletters created with this type. */
   defaultBodyHtml?: string;
+  /** When true, this type is exposed on the public /subscribe form so
+   *  visitors can sign up for it themselves. Defaults to false (admins
+   *  opt in explicitly per type). */
+  publicSubscribable?: boolean;
 }
 
 interface TypeRecord {
@@ -62,6 +66,7 @@ interface TypeRecord {
   defaultTags: string[];
   defaultSubjectPrefix?: string;
   defaultBodyHtml?: string;
+  publicSubscribable?: boolean;
   archived?: boolean;
   createdAt: string;
   createdBy?: string;
@@ -148,6 +153,10 @@ async function updateType(id: string, body: TypeInput): Promise<TypeRecord> {
       body.defaultBodyHtml !== undefined
         ? validateBodyHtml(body.defaultBodyHtml)
         : existing.defaultBodyHtml,
+    publicSubscribable:
+      body.publicSubscribable !== undefined
+        ? body.publicSubscribable === true
+        : existing.publicSubscribable,
   };
 
   // Sentinel rotation when renaming.
@@ -221,6 +230,7 @@ function normalizeInput(
     defaultTags: validateTags(body.defaultTags ?? []),
     defaultSubjectPrefix: body.defaultSubjectPrefix?.trim() || undefined,
     defaultBodyHtml: validateBodyHtml(body.defaultBodyHtml),
+    publicSubscribable: body.publicSubscribable === true,
     createdAt,
     createdBy: claims.email ?? claims.sub,
   };

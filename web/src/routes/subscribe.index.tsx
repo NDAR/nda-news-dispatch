@@ -52,8 +52,15 @@ function SubscribePage() {
 
   // Lock the type field when it was preset via the URL — that's the per-type
   // "subscribe to *this* newsletter" link case. Without a preset, show the
-  // chooser so visitors landing on the bare /subscribe page can pick.
+  // chooser only if there's more than one subscribable type. With exactly
+  // one option, silently auto-select it instead of showing a single-item
+  // dropdown.
   const typeLocked = !!presetType;
+  useEffect(() => {
+    if (typeLocked) return;
+    if (types.length === 1 && !typeId) setTypeId(types[0].id);
+  }, [typeLocked, types, typeId]);
+  const showTypeChooser = !typeLocked && types.length > 1;
 
   // Load Turnstile script + render the widget when a site key is configured.
   useEffect(() => {
@@ -129,12 +136,32 @@ function SubscribePage() {
     ? types.find((t) => t.id === presetType)?.name ?? null
     : null;
 
+  // Single-type case: show the type name in the lede so the visitor knows
+  // exactly what they're signing up for, even though the dropdown is hidden.
+  const soloTypeName = !typeLocked && types.length === 1 ? types[0].name : null;
+
+  // No subscribable types at all and no preset → there's nothing to sign up
+  // for. Render a friendly note instead of an empty form.
+  if (!presetType && !typesQ.isLoading && types.length === 0) {
+    return (
+      <PublicShell>
+        <h1>Subscribe to {config.brand.full}</h1>
+        <p>Public sign-ups are currently closed. Check back later.</p>
+      </PublicShell>
+    );
+  }
+
   return (
     <PublicShell>
       <h1>Subscribe to {config.brand.full}</h1>
       {presetTypeName && (
         <p className="lede">
           You're signing up for <strong>{presetTypeName}</strong>.
+        </p>
+      )}
+      {!presetTypeName && soloTypeName && (
+        <p className="lede">
+          You're signing up for <strong>{soloTypeName}</strong>.
         </p>
       )}
       <form onSubmit={onSubmit} className="form">
@@ -160,11 +187,11 @@ function SubscribePage() {
           />
         </label>
 
-        {!typeLocked && types.length > 0 && (
+        {showTypeChooser && (
           <label>
             <span>Newsletter</span>
             <select value={typeId} onChange={(e) => setTypeId(e.target.value)}>
-              <option value="">Any (default)</option>
+              <option value="">Choose a newsletter…</option>
               {types.map((t) => (
                 <option key={t.id} value={t.id}>{t.name}</option>
               ))}

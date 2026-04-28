@@ -44,6 +44,9 @@ export interface NewsletterType {
   defaultSubjectPrefix?: string;
   /** Optional HTML body seeded into new newsletters created with this type. */
   defaultBodyHtml?: string;
+  /** When true, this type appears on the public /subscribe form and visitors
+   *  can sign themselves up for it. */
+  publicSubscribable?: boolean;
   archived?: boolean;
   createdAt: string;
   createdBy?: string;
