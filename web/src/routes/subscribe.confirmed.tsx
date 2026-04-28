@@ -2,7 +2,7 @@ import { createFileRoute } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
 import { listPublicTypes } from '../api/endpoints';
 import { config } from '../config';
-import { PublicShell } from './subscribe';
+import { PublicShell } from '../components/PublicShell';
 
 export const Route = createFileRoute('/subscribe/confirmed')({
   component: SubscribeConfirmed,

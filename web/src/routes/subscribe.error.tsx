@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from '@tanstack/react-router';
-import { PublicShell } from './subscribe';
+import { PublicShell } from '../components/PublicShell';
 
 export const Route = createFileRoute('/subscribe/error')({
   component: SubscribeError,
