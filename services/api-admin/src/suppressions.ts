@@ -79,25 +79,47 @@ async function listSuppressions(event: APIGatewayProxyEvent): Promise<{ items: S
   // Single-table layout: SUPP#<email> rows have SK starting with TYPE#. We
   // also include legacy REASON#-prefixed rows so the operator can see (and
   // delete) them during the migration window.
+  //
+  // We paginate the Scan because DynamoDB applies `Limit` BEFORE the
+  // FilterExpression — without pagination a table with lots of non-SUPP
+  // rows (campaign RCPT rows etc.) silently returns zero matches even when
+  // SUPP rows exist. Cap total raw rows scanned at PAGE_CAP per request to
+  // keep one Lambda invocation predictable; admins can re-call to keep
+  // walking via cursor if it's ever exceeded (we don't yet expose one,
+  // because suppression lists are small in practice).
   const limit = clampInt(event.queryStringParameters?.limit, 1, 500, 100);
   const scope = parseScopeQuery(event.queryStringParameters?.scope);
   const typeIdFilter = event.queryStringParameters?.typeId;
-  const res = await ddb.send(
-    new ScanCommand({
-      TableName: TABLE,
-      FilterExpression: 'begins_with(PK, :p) AND (begins_with(SK, :tsk) OR begins_with(SK, :rsk))',
-      ExpressionAttributeValues: { ':p': 'SUPP#', ':tsk': 'TYPE#', ':rsk': 'REASON#' },
-      Limit: limit,
-    }),
-  );
+  const PAGE_SIZE = 1000;
+  const PAGE_CAP = 50_000;
+
   const items: SuppressionListItem[] = [];
-  for (const raw of res.Items ?? []) {
-    const item = await mapSuppressionItem(raw as Record<string, unknown>);
-    if (!item) continue;
-    if (scope && item.scope !== scope) continue;
-    if (typeIdFilter && item.typeId !== typeIdFilter) continue;
-    items.push(item);
+  let scanned = 0;
+  let cursor: Record<string, unknown> | undefined;
+
+  while (items.length < limit && scanned < PAGE_CAP) {
+    const res = await ddb.send(
+      new ScanCommand({
+        TableName: TABLE,
+        FilterExpression: 'begins_with(PK, :p) AND (begins_with(SK, :tsk) OR begins_with(SK, :rsk))',
+        ExpressionAttributeValues: { ':p': 'SUPP#', ':tsk': 'TYPE#', ':rsk': 'REASON#' },
+        Limit: PAGE_SIZE,
+        ExclusiveStartKey: cursor,
+      }),
+    );
+    scanned += res.ScannedCount ?? 0;
+    for (const raw of res.Items ?? []) {
+      const item = await mapSuppressionItem(raw as Record<string, unknown>);
+      if (!item) continue;
+      if (scope && item.scope !== scope) continue;
+      if (typeIdFilter && item.typeId !== typeIdFilter) continue;
+      items.push(item);
+      if (items.length >= limit) break;
+    }
+    cursor = res.LastEvaluatedKey;
+    if (!cursor) break;
   }
+
   return { items };
 }
 
