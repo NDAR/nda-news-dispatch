@@ -724,7 +724,7 @@ function ComposePage() {
                   className="input"
                   value={assetBase}
                   onChange={(e) => setAssetBase(e.target.value)}
-                  placeholder="Asset base URL (e.g. https://nimhda.org)"
+                  placeholder="Asset base URL (e.g. https://example.org)"
                   title="Resolves relative <img>/<a> URLs in the preview. Saved per-browser."
                   style={{ flex: 1, fontSize: 11, padding: '4px 8px', fontFamily: 'var(--mono)' }}
                 />
