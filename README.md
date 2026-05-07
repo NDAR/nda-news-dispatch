@@ -14,7 +14,7 @@ The default brand prefix is **Ants** (configurable per build via
 
 | Layer            | Choice                                                              |
 |------------------|---------------------------------------------------------------------|
-| **Frontend**     | Vite, React 18, TypeScript, TanStack Router, TanStack Query, TipTap |
+| **Frontend**     | Vite, React 18, TypeScript, TanStack Router, TanStack Query, TinyMCE 7 |
 | **Auth**         | AWS Cognito (Hosted UI, OAuth 2.0 PKCE)                             |
 | **API**          | API Gateway (Regional REST) → Node.js 20 Lambdas, AWS WAF v2        |
 | **Data**         | DynamoDB single-table design with GSI1, streams, PITR, TTL          |
@@ -504,16 +504,39 @@ identity, and Cognito's allowed callback URL.
 
 Copyright © 2026 ScientHouse LLC
 
-Released under the **MIT License** — see [`LICENSE`](./LICENSE) for the full
-text. You may use, copy, modify, merge, publish, distribute, sublicense, and
-sell copies of the software, including in proprietary or SaaS products,
-provided the copyright notice and the license text are kept in any
-substantial portion of the software you distribute.
+This project is **dual-licensed by component**:
+
+- **Backend, infrastructure, shared packages, and tooling** (`infra/`,
+  `services/`, `packages/`, `scripts/`, root `deploy.sh`, root `package.json`)
+  — released under the **MIT License**. See [`LICENSE`](./LICENSE).
+- **Compiled web SPA bundle** (the output of `npm run build` in `web/` —
+  i.e. `web/dist/`) — distributed under the **GNU General Public License,
+  version 2 or later (GPL-2.0-or-later)**, because that bundle statically
+  links TinyMCE 7, which is GPL-2.0-or-later. See
+  [`LICENSE.gpl-2.0`](./LICENSE.gpl-2.0).
+
+The individual source files under `web/src/` remain **MIT** in this
+repository (anyone may take a file and reuse it under MIT). Only the
+combined production bundle picks up the GPL-2 obligation, because that's
+where TinyMCE's compiled code lives alongside ours.
+
+If you redistribute the compiled SPA — for example by hosting it for
+end users or shipping it inside another product — GPL-2 requires that
+you either bundle the corresponding source code with it or offer a
+written promise to provide the source on request. The source is this
+repository.
 
 ### Third-party notices
 
-This project bundles or links to permissively-licensed dependencies (React,
-TanStack, TipTap, AWS SDK, AWS CDK, Zod, Vite, etc.) under MIT or Apache-2.0,
-and uses Source Serif 4, Inter, and JetBrains Mono via Google Fonts under the
-SIL Open Font License 1.1. Run `npx license-checker --production --summary`
-from the repo root to regenerate the full attribution list.
+See [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) for the per-package
+attribution list. The licensing-significant dependencies are:
+
+- **TinyMCE 7** — GPL-2.0-or-later (Tiny Technologies, Inc.). Bundled into
+  the production SPA at build time.
+- React, TanStack Router/Query, AWS SDK v3, AWS CDK v2, Zod, Vite, etc.
+  — MIT or Apache-2.0.
+- Source Serif 4, Inter, JetBrains Mono via Google Fonts — SIL Open Font
+  License 1.1.
+
+Regenerate the full attribution list with
+`npx license-checker --production --summary` from the repo root.
