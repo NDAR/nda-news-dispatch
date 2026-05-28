@@ -98,7 +98,11 @@ export class ApiStack extends Stack {
       entry: path.resolve(repoRoot, 'services/api-admin/src/contacts.ts'),
       handler: 'handler',
       memorySize: 512,
-      timeout: Duration.seconds(15),
+      // 28 s sits just under API Gateway's 29 s integration timeout. The
+      // POST /admin/contacts/delete-all route uses most of the budget to
+      // drain a CONTACT# partition; the client loops the call until done.
+      // Read paths still return in well under a second.
+      timeout: Duration.seconds(28),
       environment: {
         ENV_NAME: config.envName,
         TABLE_NAME: table.tableName,
@@ -120,6 +124,9 @@ export class ApiStack extends Stack {
     });
     table.grantReadWriteData(importsFn);
     importsBucket.grantPut(importsFn, 'imports/*');
+    // Read perms back the import-history "Download CSV" endpoint, which
+    // issues presigned GETs for previously-uploaded raw files.
+    importsBucket.grantRead(importsFn, 'imports/*');
 
     const campaignsFn = new NodejsFunction(this, 'CampaignsFn', {
       ...baseFnProps,
@@ -393,6 +400,10 @@ export class ApiStack extends Stack {
     const contacts = admin.addResource('contacts');
     contacts.addMethod('GET', new LambdaIntegration(contactsFn), authOpts);
     contacts.addMethod('POST', new LambdaIntegration(contactsFn), authOpts);
+    // Iterative bulk-delete. Registered as a separate resource so the
+    // method-vs-{email} routing in API Gateway is unambiguous.
+    const contactsDeleteAll = contacts.addResource('delete-all');
+    contactsDeleteAll.addMethod('POST', new LambdaIntegration(contactsFn), authOpts);
     const contactByEmail: IResource = contacts.addResource('{email}');
     contactByEmail.addMethod('GET', new LambdaIntegration(contactsFn), authOpts);
     contactByEmail.addMethod('PATCH', new LambdaIntegration(contactsFn), authOpts);
@@ -403,6 +414,9 @@ export class ApiStack extends Stack {
     imports.addMethod('POST', new LambdaIntegration(importsFn), authOpts);
     const importById: IResource = imports.addResource('{id}');
     importById.addMethod('GET', new LambdaIntegration(importsFn), authOpts);
+    // Presigned GET for the original CSV — backs the "Download" button on
+    // the import-history view.
+    importById.addResource('download').addMethod('GET', new LambdaIntegration(importsFn), authOpts);
 
     const campaigns = admin.addResource('campaigns');
     campaigns.addMethod('GET', new LambdaIntegration(campaignsFn), authOpts);
@@ -427,6 +441,10 @@ export class ApiStack extends Stack {
     tags.addMethod('GET', new LambdaIntegration(audienceFn), authOpts);
     const audience = admin.addResource('audience');
     audience.addResource('preview').addMethod('POST', new LambdaIntegration(audienceFn), authOpts);
+    // Lightweight count endpoint backing the TopBar indicator. Uses
+    // `Select: 'COUNT'` on the GSI2 status index so it's roughly 5–10×
+    // faster than POST /preview for the no-filter case.
+    audience.addResource('count').addMethod('GET', new LambdaIntegration(audienceFn), authOpts);
 
     const assets = admin.addResource('assets');
     assets.addMethod('GET', new LambdaIntegration(assetsFn), authOpts);

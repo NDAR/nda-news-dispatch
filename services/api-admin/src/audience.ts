@@ -2,9 +2,13 @@ import type { APIGatewayProxyHandler, APIGatewayProxyEvent, APIGatewayProxyResul
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
   DynamoDBDocumentClient,
+  QueryCommand,
   ScanCommand,
 } from '@aws-sdk/lib-dynamodb';
-import { materializeAudienceProfiles } from '../../../packages/shared/src';
+import {
+  contactStatusIndexPk,
+  materializeAudienceProfiles,
+} from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -21,6 +25,8 @@ export const handler: APIGatewayProxyHandler = async (event) => {
     switch (route) {
       case 'GET /admin/tags':
         return ok(await listAllTags());
+      case 'GET /admin/audience/count':
+        return ok(await countActiveAudience());
       case 'POST /admin/audience/preview':
         return ok(await previewAudience(parseBody(event)));
       default:
@@ -73,6 +79,56 @@ async function listAllTags(): Promise<TagsResponse> {
     .map(([tag, count]) => ({ tag, count }))
     .sort((a, b) => (b.count - a.count) || a.tag.localeCompare(b.tag));
   return { items };
+}
+
+// ── GET /admin/audience/count ──────────────────────────────────────────────
+
+/**
+ * Fast count of "sendable" contacts: status = active AND not globally
+ * suppressed. Used by the TopBar's "X on the list" indicator and any
+ * other place that needs the denominator without the full audience.
+ *
+ * Why this exists separately from previewAudience: the preview endpoint
+ * materializes every matching profile into Lambda memory (to compute
+ * topTags + a preview sample), then transports the full result set over
+ * the wire. For a count-only consumer that's ~4 MB of wasted IO at 13K
+ * contacts, 10x worse at 50K. This endpoint instead runs a DDB Query
+ * with `Select: 'COUNT'` so DynamoDB walks the index server-side and
+ * returns just the integer per page — no items materialized, no
+ * serialization. Pagination is still required because each Query page
+ * is capped at 1 MB *scanned*, but each round-trip is tiny.
+ *
+ * The FilterExpression mirrors `makeSuppressionFilter(undefined)` from
+ * the shared audience module: drop both the new `suppressedGlobal` flag
+ * and the legacy `suppressed` boolean so pre- and post-migration data
+ * count identically.
+ */
+async function countActiveAudience(): Promise<{ count: number }> {
+  let count = 0;
+  let cursor: Record<string, unknown> | undefined;
+  do {
+    const res = await ddb.send(
+      new QueryCommand({
+        TableName: TABLE,
+        IndexName: 'GSI2',
+        KeyConditionExpression: 'GSI2PK = :pk',
+        // `=` returns false against a missing attribute in DDB, so
+        // `NOT attr = :true` is true for both "attribute missing" and
+        // "attribute exists with value false" — exactly the behavior we
+        // want for both denorm fields.
+        FilterExpression: '(NOT suppressedGlobal = :true) AND (NOT suppressed = :true)',
+        ExpressionAttributeValues: {
+          ':pk': contactStatusIndexPk('active'),
+          ':true': true,
+        },
+        Select: 'COUNT',
+        ExclusiveStartKey: cursor,
+      }),
+    );
+    count += res.Count ?? 0;
+    cursor = res.LastEvaluatedKey;
+  } while (cursor);
+  return { count };
 }
 
 // ── POST /admin/audience/preview ───────────────────────────────────────────

@@ -7,7 +7,7 @@ import {
   PutCommand,
   QueryCommand,
 } from '@aws-sdk/lib-dynamodb';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
@@ -30,6 +30,8 @@ export const handler: APIGatewayProxyHandler = async (event) => {
         return ok(await listImports());
       case 'GET /admin/imports/{id}':
         return ok(await getImport(path(event, 'id')));
+      case 'GET /admin/imports/{id}/download':
+        return ok(await getImportDownloadUrl(path(event, 'id')));
       default:
         return err(404, 'not-found', `No route for ${route}`);
     }
@@ -121,6 +123,51 @@ async function getImport(id: string): Promise<unknown> {
   );
   if (!res.Item) throw new HttpError(404, 'not-found', `Import ${id} not found`);
   return stripKeys(res.Item);
+}
+
+/**
+ * Presigned GET URL for the original CSV the operator uploaded. Backs the
+ * "Download" button on the import-history view. We pass
+ * `ResponseContentDisposition` so the file lands on disk with the
+ * operator's chosen filename instead of the bucket's UUID-based key.
+ *
+ * Files are retained per the imports bucket lifecycle policy (currently
+ * 365 days, see infra/lib/processing-stack.ts). After expiry the S3
+ * object is gone and the presigned URL will resolve to a 404; the IMPORT
+ * META row in DDB sticks around indefinitely so the audit trail of
+ * "this import happened, with these counts" outlives the raw file.
+ */
+async function getImportDownloadUrl(id: string): Promise<{
+  url: string;
+  expiresIn: number;
+  filename: string;
+}> {
+  const res = await ddb.send(
+    new GetCommand({ TableName: TABLE, Key: { PK: `IMPORT#${id}`, SK: 'META' } }),
+  );
+  if (!res.Item) throw new HttpError(404, 'not-found', `Import ${id} not found`);
+  const key = res.Item.key as string | undefined;
+  if (!key) throw new HttpError(404, 'no-file', `Import ${id} has no stored file`);
+
+  const rawFilename = (res.Item.filename as string | undefined) ?? `${id}.csv`;
+  // Strip anything that's awkward in a Content-Disposition header. ASCII
+  // letters/digits + a handful of safe punctuation only; otherwise the
+  // browser saves under a useless default. We also cap length so a
+  // pathological filename can't blow header limits.
+  const safeFilename =
+    rawFilename.replace(/[^A-Za-z0-9._\- ]+/g, '_').slice(0, 120) || `${id}.csv`;
+
+  const url = await getSignedUrl(
+    s3,
+    new GetObjectCommand({
+      Bucket: IMPORTS_BUCKET,
+      Key: key,
+      ResponseContentDisposition: `attachment; filename="${safeFilename}"`,
+      ResponseContentType: 'text/csv',
+    }),
+    { expiresIn: PRESIGN_TTL_SECONDS },
+  );
+  return { url, expiresIn: PRESIGN_TTL_SECONDS, filename: safeFilename };
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────

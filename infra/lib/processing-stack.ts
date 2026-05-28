@@ -56,7 +56,10 @@ export class ProcessingStack extends Stack {
       {
         id: 'expire-raw-imports',
         prefix: 'imports/',
-        expiration: Duration.days(30),
+        // Retained for audit / re-download from the import history view.
+        // Adjust if compliance requires longer (e.g. 7 years for some
+        // regulated workloads) or shorter for cost.
+        expiration: Duration.days(365),
         abortIncompleteMultipartUploadAfter: Duration.days(1),
       },
     ];
@@ -91,7 +94,10 @@ export class ProcessingStack extends Stack {
     this.importQueue = new Queue(this, 'ImportQueue', {
       queueName: `ants-dispatch-${config.envName}-import`,
       encryption: QueueEncryption.SQS_MANAGED,
-      visibilityTimeout: Duration.seconds(120),
+      // Must stay strictly greater than workerImport.timeout — otherwise SQS
+      // can redeliver a message to a second invocation while the first is
+      // still working through a large CSV, producing duplicate writes.
+      visibilityTimeout: Duration.minutes(6),
       retentionPeriod: Duration.days(4),
       deadLetterQueue: { maxReceiveCount: 5, queue: this.importDlq },
     });
@@ -108,7 +114,10 @@ export class ProcessingStack extends Stack {
       runtime: Runtime.NODEJS_20_X,
       architecture: Architecture.ARM_64,
       memorySize: 1024,
-      timeout: Duration.minutes(2),
+      // 5 min covers a 50K-row CSV with comfortable headroom on the batched
+      // pipeline (chunks of 100 rows, ~150s budget for the worst case). Must
+      // stay strictly less than the SQS visibility timeout above.
+      timeout: Duration.minutes(5),
       tracing: Tracing.ACTIVE,
       logRetention: RetentionDays.ONE_MONTH,
       loggingFormat: LoggingFormat.JSON,

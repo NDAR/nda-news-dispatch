@@ -6,7 +6,7 @@ import {
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
-import { batchWriteAll, contactStatusIndexFields } from '../../../packages/shared/src';
+import { batchGetAll, batchWriteAll, contactStatusIndexFields } from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -15,6 +15,22 @@ const s3 = new S3Client({});
 const TABLE = mustEnv('TABLE_NAME');
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Rows-per-chunk for bulk processing. 100 is DynamoDB's BatchGetItem maximum
+// — anything larger would have to be split internally anyway. Each chunk
+// issues ~2 BatchGet round-trips + a handful of BatchWrites, so for a 50K
+// CSV we converge on a few hundred round-trips total instead of the 100K+
+// the previous per-row code generated.
+const IMPORT_CHUNK_SIZE = 100;
+// Cap on how many per-row failure records we attach to the IMPORT META
+// item. 2000 entries × ~80 bytes leaves comfortable headroom under DDB's
+// 400KB item limit alongside the existing fields. When exceeded we set
+// `failuresTruncated: true` so the UI can call it out; the aggregate
+// `counts.{invalid,suppressed}` totals stay accurate either way.
+const MAX_FAILURES = 2000;
+// Raw `email` field values from invalid rows can be anything (garbage,
+// long strings). Truncate before persisting so a pathological CSV can't
+// blow the DDB item limit single-handedly.
+const MAX_FAILURE_EMAIL_LENGTH = 200;
 
 /**
  * SQS trigger — receives S3 PutObject events for the imports bucket.
@@ -66,34 +82,65 @@ async function processS3Record(rec: S3EventRecord): Promise<void> {
   try {
     const text = await readObject(bucket, key);
     const rows = parseCSV(text);
-    const counts = { total: rows.length, inserted: 0, updated: 0, suppressed: 0, invalid: 0 };
+    const counts: ImportCounts = { total: rows.length, inserted: 0, updated: 0, suppressed: 0, invalid: 0 };
 
+    // Per-row failure log surfaced to the operator via the import banner.
+    // `recordFailure` enforces the MAX_FAILURES cap and flips the
+    // `truncated` flag once exceeded so the UI can warn that the list is
+    // partial. Aggregate counts above are unaffected by the cap.
+    const failures: ImportFailure[] = [];
+    let failuresTruncated = false;
+    const recordFailure = (email: string, reason: ImportFailure['reason']): void => {
+      if (failures.length < MAX_FAILURES) {
+        failures.push({
+          email: email.slice(0, MAX_FAILURE_EMAIL_LENGTH),
+          reason,
+        });
+      } else {
+        failuresTruncated = true;
+      }
+    };
+
+    // Dedupe by lowercased email. The same address appearing multiple times
+    // in a single CSV is collapsed to one DDB write, but its eventual outcome
+    // (inserted / updated / suppressed) is tallied against EVERY occurrence
+    // so the per-row counters still sum to `total`. Invalid-email rows are
+    // tallied immediately, one per CSV row, and don't reach the chunker.
+    const byEmail = new Map<string, { row: Record<string, string>; occurrences: number }>();
     for (const row of rows) {
-      const email = (row.email ?? '').trim().toLowerCase();
+      const rawEmail = row.email ?? '';
+      const email = rawEmail.trim().toLowerCase();
       if (!EMAIL_RE.test(email)) {
         counts.invalid++;
+        recordFailure(rawEmail, 'invalid');
         continue;
       }
-      const existing = await ddb.send(
-        new GetCommand({ TableName: TABLE, Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' } }),
-      );
-      if (existingSuppressed(existing.Item as Record<string, unknown> | undefined)) {
-        counts.suppressed++;
-        continue;
+      const entry = byEmail.get(email);
+      if (entry) {
+        entry.row = row;
+        entry.occurrences++;
+      } else {
+        byEmail.set(email, { row, occurrences: 1 });
       }
-      const existed = await upsertContact({
-        email,
-        name: (row.name ?? '').trim() || email.split('@')[0],
-        org: (row.org ?? row.organization ?? row.institution ?? '').trim() || undefined,
-        assignTags,
-        existing: existing.Item as Record<string, unknown> | undefined,
-      });
-      if (existed) counts.updated++;
-      else counts.inserted++;
     }
 
-    await setImportStatus(importId, 'done', counts);
-    console.log(JSON.stringify({ level: 'info', msg: 'import-done', importId, counts }));
+    const uniqueEmails = [...byEmail.keys()];
+    for (let i = 0; i < uniqueEmails.length; i += IMPORT_CHUNK_SIZE) {
+      const chunk = uniqueEmails.slice(i, i + IMPORT_CHUNK_SIZE);
+      await processChunk(chunk, byEmail, assignTags, counts, importId, recordFailure);
+    }
+
+    await setImportStatus(importId, 'done', { counts, failures, failuresTruncated });
+    console.log(
+      JSON.stringify({
+        level: 'info',
+        msg: 'import-done',
+        importId,
+        counts,
+        failureCount: failures.length,
+        failuresTruncated,
+      }),
+    );
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error(JSON.stringify({ level: 'error', msg: 'import-failed', importId, err: msg }));
@@ -104,32 +151,146 @@ async function processS3Record(rec: S3EventRecord): Promise<void> {
 
 // ── Dynamo operations ──────────────────────────────────────────────────────
 
-interface ContactUpsert {
-  email: string;
-  name: string;
-  org?: string;
-  assignTags: string[];
-  existing?: Record<string, unknown>;
+interface ImportCounts {
+  total: number;
+  inserted: number;
+  updated: number;
+  suppressed: number;
+  invalid: number;
 }
 
-async function upsertContact(c: ContactUpsert): Promise<boolean> {
-  const existing = c.existing;
-  const existed = !!existing;
+interface ImportFailure {
+  /** For `invalid`: the raw email-cell value from the CSV row, truncated.
+   *  For `suppressed`: the lowercased valid email that was skipped. */
+  email: string;
+  reason: 'invalid' | 'suppressed';
+}
+
+interface ImportResult {
+  counts: ImportCounts;
+  failures: ImportFailure[];
+  failuresTruncated: boolean;
+}
+
+/**
+ * Processes one chunk of unique emails: bulk-fetches their existing profiles
+ * AND their SUPP-GLOBAL rows in parallel, classifies each row, accumulates
+ * profile + tag-link writes, and flushes them through `batchWriteAll`.
+ *
+ * The SUPP-GLOBAL BatchGet is a belt-and-suspenders defense: the contact
+ * profile carries denormalized `suppressedGlobal` flags that should be in
+ * sync with the SUPP rows, but if drift ever occurred (manual DDB edits,
+ * partially-failed prior suppression write), the SUPP row would be the
+ * authoritative source. When we detect drift (SUPP says suppressed but the
+ * profile flag is missing) we log a structured warning and still skip the
+ * row — we deliberately do not repair the flag here to keep the hot path
+ * write-light.
+ */
+async function processChunk(
+  emails: string[],
+  byEmail: Map<string, { row: Record<string, string>; occurrences: number }>,
+  assignTags: string[],
+  counts: ImportCounts,
+  importId: string,
+  recordFailure: (email: string, reason: ImportFailure['reason']) => void,
+): Promise<void> {
+  const [profileItems, suppItems] = await Promise.all([
+    batchGetAll<Record<string, unknown>>(
+      ddb,
+      TABLE,
+      emails.map((e) => ({ PK: `CONTACT#${e}`, SK: 'PROFILE' })),
+    ),
+    batchGetAll<Record<string, unknown>>(
+      ddb,
+      TABLE,
+      emails.map((e) => ({ PK: `SUPP#${e}`, SK: 'TYPE#GLOBAL' })),
+    ),
+  ]);
+
+  const profileByEmail = new Map<string, Record<string, unknown>>();
+  for (const item of profileItems) {
+    const e = item.email;
+    if (typeof e === 'string') profileByEmail.set(e, item);
+  }
+  const suppGlobalEmails = new Set<string>();
+  for (const item of suppItems) {
+    const e = item.email;
+    if (typeof e === 'string') suppGlobalEmails.add(e);
+  }
+
+  const writes: { PutRequest?: unknown; DeleteRequest?: unknown }[] = [];
+  for (const email of emails) {
+    const entry = byEmail.get(email);
+    if (!entry) continue; // unreachable, but keeps TS happy
+    const { row, occurrences } = entry;
+    const existing = profileByEmail.get(email);
+    const profileSaysSuppressed = existingSuppressed(existing);
+    const suppRowExists = suppGlobalEmails.has(email);
+
+    if (profileSaysSuppressed || suppRowExists) {
+      // Drift case: profile exists and didn't claim suppression, but a
+      // SUPP-GLOBAL row exists. Worth surfacing — without the SUPP-row
+      // BatchGet we'd have re-admitted a globally-suppressed address.
+      if (suppRowExists && existing && !profileSaysSuppressed) {
+        console.warn(
+          JSON.stringify({
+            level: 'warn',
+            msg: 'suppression-denorm-drift',
+            importId,
+            email,
+          }),
+        );
+      }
+      counts.suppressed += occurrences;
+      recordFailure(email, 'suppressed');
+      continue;
+    }
+
+    const requests = buildContactWrites(email, row, existing, assignTags);
+    for (const r of requests) writes.push(r);
+    if (existing) counts.updated += occurrences;
+    else counts.inserted += occurrences;
+  }
+
+  if (writes.length > 0) {
+    await batchWriteAll(ddb, TABLE, writes);
+  }
+}
+
+/**
+ * Builds the DDB write requests for a single contact (profile Put + tag-link
+ * Puts for newly assigned tags). Mirrors the prior single-row upsert
+ * semantics: the CSV's name (or email local-part fallback) always wins; the
+ * CSV's org wins when present and falls back to the existing value when the
+ * CSV cell is empty; existing `status` of `unsubscribed`/`bounced` is
+ * preserved (never reset by a re-import); every suppression-related
+ * attribute on the existing row is copied forward because PutCommand
+ * wholesale-replaces items.
+ */
+function buildContactWrites(
+  email: string,
+  row: Record<string, string>,
+  existing: Record<string, unknown> | undefined,
+  assignTags: string[],
+): { PutRequest?: unknown; DeleteRequest?: unknown }[] {
   const prevTags = (existing?.tags as string[] | undefined) ?? [];
-  const newTags = c.assignTags.filter((t) => !prevTags.includes(t));
+  const newTags = assignTags.filter((t) => !prevTags.includes(t));
   const tags = newTags.length > 0 ? [...prevTags, ...newTags] : prevTags;
   const now = new Date().toISOString();
   const status =
     existing?.status === 'unsubscribed' || existing?.status === 'bounced'
       ? existing.status
       : 'active';
+  const name = (row.name ?? '').trim() || email.split('@')[0];
+  const orgFromRow = (row.org ?? row.organization ?? row.institution ?? '').trim();
+  const org = orgFromRow || (existing?.org as string | undefined);
 
   const profile: Record<string, unknown> = {
-    PK: `CONTACT#${c.email}`,
+    PK: `CONTACT#${email}`,
     SK: 'PROFILE',
-    email: c.email,
-    name: c.name || existing?.name || c.email.split('@')[0],
-    org: c.org ?? existing?.org,
+    email,
+    name,
+    org,
     tags,
     status,
     joined: existing?.joined ?? now.slice(0, 10),
@@ -138,43 +299,49 @@ async function upsertContact(c: ContactUpsert): Promise<boolean> {
     suppressedGlobal: existing?.suppressedGlobal === true,
     suppressedAt: existing?.suppressedAt,
     suppressionReason: existing?.suppressionReason,
-    ...contactStatusIndexFields(c.email, status),
+    ...contactStatusIndexFields(email, status),
   };
-  // Preserve the per-type suppression String Set across an upsert. PutCommand
-  // overwrites the entire item, so we must read it from `existing` and
-  // re-attach. DDB drops empty Sets, so only set the field when there's
-  // something to keep.
+  // DDB drops empty Sets, so only attach `suppressedTypes` when we have at
+  // least one type to preserve.
   const types = readPreservedTypeSet(existing?.suppressedTypes);
   if (types.length > 0) profile.suppressedTypes = new Set(types);
 
-  const requests: { PutRequest?: unknown; DeleteRequest?: unknown }[] = [
+  return [
     { PutRequest: { Item: profile } },
     ...newTags.map((t) => ({
       PutRequest: {
         Item: {
-          PK: `CONTACT#${c.email}`,
+          PK: `CONTACT#${email}`,
           SK: `TAG#${t}`,
           GSI1PK: `TAG#${t}`,
-          GSI1SK: `CONTACT#${c.email}`,
-          email: c.email,
+          GSI1SK: `CONTACT#${email}`,
+          email,
         },
       },
     })),
   ];
-  await batchWriteAll(ddb, TABLE, requests);
-  return existed;
 }
 
 async function setImportStatus(
   importId: string,
   status: string,
-  counts?: Record<string, number>,
+  result?: ImportResult,
   errorMsg?: string,
 ): Promise<void> {
   const parts: string[] = ['#s = :s', 'updatedAt = :u'];
   const values: Record<string, unknown> = { ':s': status, ':u': new Date().toISOString() };
   const names: Record<string, string> = { '#s': 'status' };
-  if (counts) { parts.push('counts = :c'); values[':c'] = counts; }
+  if (result) {
+    parts.push('counts = :c');
+    values[':c'] = result.counts;
+    // Always persist `failures` so the UI can rely on its presence — an
+    // empty array means "import succeeded with nothing to report" rather
+    // than "we don't know yet". Same for the truncated flag.
+    parts.push('failures = :f');
+    values[':f'] = result.failures;
+    parts.push('failuresTruncated = :ft');
+    values[':ft'] = result.failuresTruncated;
+  }
   if (errorMsg) { parts.push('#e = :e'); values[':e'] = errorMsg; names['#e'] = 'error'; }
   await ddb.send(
     new UpdateCommand({

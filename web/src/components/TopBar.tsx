@@ -1,6 +1,6 @@
 import { useRouterState } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
-import { listTemplates, previewAudience } from '../api/endpoints';
+import { getAudienceCount, listTemplates } from '../api/endpoints';
 
 interface Title {
   eyebrow: string;
@@ -38,8 +38,8 @@ export function TopBar() {
     staleTime: 60_000,
   });
   const audienceQ = useQuery({
-    queryKey: ['audience-preview', 'all-active'],
-    queryFn: () => previewAudience({ tags: [], excludeTags: [], tagMode: 'all' }),
+    queryKey: ['audience-count'],
+    queryFn: getAudienceCount,
     enabled: matchKey === '/subscribers',
     staleTime: 60_000,
   });
@@ -51,7 +51,7 @@ export function TopBar() {
     const n = templatesQ.data.length;
     sub = `${n.toLocaleString()} newsletter${n === 1 ? '' : 's'} in progress`;
   } else if (matchKey === '/subscribers' && audienceQ.data) {
-    const n = audienceQ.data.total ?? audienceQ.data.count ?? 0;
+    const n = audienceQ.data.count;
     sub = `${n.toLocaleString()} on the list`;
   } else if (matchKey === '/history' && path !== '/history') {
     sub = 'Campaign detail';
