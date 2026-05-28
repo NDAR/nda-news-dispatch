@@ -258,8 +258,19 @@ async function deleteAllContacts(
   // Best-effort audit update — the OP row tracks cumulative deleted +
   // status. If this fails the actual deletion still happened, so we
   // don't surface the error to the caller, but we do log it.
+  //
+  // Mid-operation we use a delta-summed running total so the history
+  // tab can show approximate progress while the wipe is in flight. On
+  // the final iteration we overwrite with an authoritative count
+  // (startedWith − currentActive) to neutralize the over-count that
+  // GSI2 eventual-consistency produces when a previously-deleted
+  // profile briefly reappears in a later iteration's query.
   try {
-    await updateDeleteAllOperationRecord(operationId, result.deleted, result.done);
+    if (result.done) {
+      await finalizeDeleteAllOperationRecord(operationId);
+    } else if (result.deleted > 0) {
+      await accumulateDeleteAllOperationRecord(operationId, result.deleted);
+    }
   } catch (e) {
     console.error(
       JSON.stringify({
@@ -373,22 +384,68 @@ async function deleteOneBatch(items: { PK: string; SK: string }[]): Promise<numb
 }
 
 /**
+ * Counts active contact profiles via a GSI2 query with `Select: 'COUNT'`.
+ * DDB walks the `CONTACTSTATUS#active` partition server-side and returns
+ * just the integer per page — no items materialized. Used by the
+ * delete-all audit flow to capture authoritative before/after counts;
+ * intentionally has NO suppression filter so it matches the same row set
+ * that delete-all itself targets.
+ */
+async function countActiveContacts(): Promise<number> {
+  let count = 0;
+  let cursor: Record<string, unknown> | undefined;
+  do {
+    const res = await ddb.send(
+      new QueryCommand({
+        TableName: TABLE,
+        IndexName: 'GSI2',
+        KeyConditionExpression: 'GSI2PK = :pk',
+        ExpressionAttributeValues: { ':pk': 'CONTACTSTATUS#active' },
+        Select: 'COUNT',
+        ExclusiveStartKey: cursor,
+      }),
+    );
+    count += res.Count ?? 0;
+    cursor = res.LastEvaluatedKey;
+  } while (cursor);
+  return count;
+}
+
+/**
  * Idempotent first-touch of the audit row for a delete-all operation.
+ *
+ * On first create, we capture `startedWith` (active count at the start
+ * of the operation) so that on completion we can compute an
+ * authoritative `deleted = startedWith − currentActive`. Without this
+ * baseline the running-delta tally over-counts by ~5% when GSI2's
+ * eventually-consistent index briefly resurfaces just-deleted rows in
+ * subsequent iterations.
  *
  * The OP row lives in the same partition the import-history view reads
  * (GSI1PK = 'IMPORT#all') so imports and delete-ops show up together,
  * sorted by GSI1SK (timestamp). The `type` field discriminates so the
  * UI can render each kind differently.
  *
- * Uses a conditional Put with `attribute_not_exists(PK)` so concurrent
- * first-call retries from the client don't clobber an in-progress row's
- * counts back to zero. The ConditionalCheckFailed case is the expected
- * "row already created by an earlier call" path — swallowed silently.
+ * Pre-Get short-circuits the (more expensive) count + conditional Put
+ * on every call after the first. Concurrent first-call retries that
+ * race past the Get both run the count query but the conditional Put
+ * still keeps only one row — the wasted count is just latency, not
+ * correctness.
  */
 async function ensureDeleteAllOperationRecord(
   operationId: string,
   claims: { sub?: string; email?: string },
 ): Promise<void> {
+  const existing = await ddb.send(
+    new GetCommand({
+      TableName: TABLE,
+      Key: { PK: `OP#${operationId}`, SK: 'META' },
+      ProjectionExpression: 'PK',
+    }),
+  );
+  if (existing.Item) return;
+
+  const startedWith = await countActiveContacts();
   const now = new Date().toISOString();
   try {
     await ddb.send(
@@ -403,6 +460,7 @@ async function ensureDeleteAllOperationRecord(
           type: 'delete-all',
           status: 'processing',
           deleted: 0,
+          startedWith,
           createdAt: now,
           updatedAt: now,
           createdBy: claims.email ?? claims.sub,
@@ -411,44 +469,75 @@ async function ensureDeleteAllOperationRecord(
       }),
     );
   } catch (e) {
-    // Row already exists — every call after the first hits this. Don't
-    // re-raise anything that isn't ConditionalCheckFailed.
+    // Row already exists — concurrent first-call race. Don't re-raise
+    // anything that isn't ConditionalCheckFailed.
     const name = (e as { name?: string } | undefined)?.name;
     if (name !== 'ConditionalCheckFailedException') throw e;
   }
 }
 
 /**
- * Increments the OP row's `deleted` counter by this call's delta and
- * flips status to `done` when the operation completes. Uses an UPDATE
- * (not PUT) so we can't accidentally clobber concurrent progress writes
- * — `if_not_exists(deleted, :zero) + :delta` is a safe atomic add even
- * if multiple client retries land in unexpected order.
+ * Mid-operation progress update. Atomic add so multiple retries can't
+ * trample each other — final number is overwritten with an authoritative
+ * value by `finalizeDeleteAllOperationRecord` so any over-count here
+ * gets washed out on completion.
  */
-async function updateDeleteAllOperationRecord(
+async function accumulateDeleteAllOperationRecord(
   operationId: string,
   delta: number,
-  done: boolean,
 ): Promise<void> {
   const now = new Date().toISOString();
-  const sets = [
-    'deleted = if_not_exists(deleted, :zero) + :delta',
-    'updatedAt = :now',
-  ];
-  const values: Record<string, unknown> = { ':zero': 0, ':delta': delta, ':now': now };
-  const names: Record<string, string> = {};
-  if (done) {
-    sets.push('#s = :done', 'completedAt = :now');
-    values[':done'] = 'done';
-    names['#s'] = 'status';
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { PK: `OP#${operationId}`, SK: 'META' },
+      UpdateExpression:
+        'SET deleted = if_not_exists(deleted, :zero) + :delta, updatedAt = :now',
+      ExpressionAttributeValues: { ':zero': 0, ':delta': delta, ':now': now },
+    }),
+  );
+}
+
+/**
+ * Completion update. Replaces (not adds to) `deleted` with the
+ * authoritative count: how many active rows actually disappeared during
+ * the operation. Falls back to leaving the running delta as-is if
+ * `startedWith` wasn't captured (e.g. legacy OP row, or the initial
+ * count query failed on first call).
+ */
+async function finalizeDeleteAllOperationRecord(operationId: string): Promise<void> {
+  const [op, endCount] = await Promise.all([
+    ddb.send(
+      new GetCommand({
+        TableName: TABLE,
+        Key: { PK: `OP#${operationId}`, SK: 'META' },
+        ProjectionExpression: 'startedWith',
+      }),
+    ),
+    countActiveContacts(),
+  ]);
+  const startedWith = op.Item?.startedWith;
+  const now = new Date().toISOString();
+
+  const sets = ['#s = :done', 'completedAt = :now', 'updatedAt = :now'];
+  const values: Record<string, unknown> = { ':done': 'done', ':now': now };
+  const names: Record<string, string> = { '#s': 'status' };
+
+  if (typeof startedWith === 'number') {
+    sets.push('deleted = :final');
+    // Concurrent imports during the wipe could in theory leave end >
+    // start, producing a negative number. Clamp to 0 so the audit row
+    // never shows a nonsensical value.
+    values[':final'] = Math.max(0, startedWith - endCount);
   }
+
   await ddb.send(
     new UpdateCommand({
       TableName: TABLE,
       Key: { PK: `OP#${operationId}`, SK: 'META' },
       UpdateExpression: 'SET ' + sets.join(', '),
       ExpressionAttributeValues: values,
-      ExpressionAttributeNames: Object.keys(names).length ? names : undefined,
+      ExpressionAttributeNames: names,
     }),
   );
 }
