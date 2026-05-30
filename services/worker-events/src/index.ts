@@ -15,17 +15,23 @@ import { applySuppression, contactStatusIndexFields, suppressionState } from '..
  * SES Open and Click events that look identical to real engagement.
  *
  * Two cheap heuristics catch most of them:
- *   1. SCANNER_WINDOW_MS — events that arrive within this many ms after
- *      Delivery are almost certainly the gateway's pre-fetch sweep, not a
- *      human reading mail. Real opens almost never happen in <30s.
- *   2. SCANNER_UA_RE — Click events sometimes carry a user-agent that
- *      identifies the security product directly. We drop those even if
- *      they arrive outside the time window.
+ *   1. SCANNER_UA_RE — Open/Click events sometimes carry a user-agent that
+ *      identifies the security product directly. This is the high-signal
+ *      half and we always honor it.
+ *   2. SCANNER_WINDOW_MS — events that arrive within this many ms after
+ *      Delivery were likely produced by a pre-fetch sweep, not a human.
+ *      Only applied when the event carries NO userAgent at all — a UA-less
+ *      event is more suspect, and a UA-bearing event we couldn't classify
+ *      is more likely a real user than a scanner.
+ *
+ * The window is intentionally short. Anything wider drops genuine
+ * fast-opens (iOS Mail previews, Gmail tab prefetches, operators verifying
+ * a test send), which is what caused the original 3-recipient undercount.
  *
  * When a heuristic matches we log the event for observability and return
  * without touching stats / RCPT timestamps / per-link counters.
  */
-const SCANNER_WINDOW_MS = 30_000;
+const SCANNER_WINDOW_MS = 5_000;
 const SCANNER_UA_RE = /\b(MSOffice|Microsoft Office|Outlook-iOS|Mimecast|Proofpoint|Barracuda|FireEye|Cisco|Symantec|Talos|Defender|SafeLinks|Forcepoint|Trustwave|Sophos|Bitdefender|Zscaler|MailControl|MessageLabs|Avast|AVG|McAfee|Microsoft URL Reputation|HeadlessChrome|Wget|curl|Go-http-client|libwww|Java\/[0-9]|python-requests)\b/i;
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
@@ -374,6 +380,11 @@ async function isScannerEvent(
   userAgent: string | undefined,
 ): Promise<boolean> {
   if (userAgent && SCANNER_UA_RE.test(userAgent)) return true;
+  // Time-window check only fires when no userAgent is reported. A UA-bearing
+  // event we couldn't match is much more likely to be a real user than a
+  // scanner (real iOS/Android/Gmail clients can open within seconds), and
+  // dropping it caused the small-audience open undercount we just fixed.
+  if (userAgent) return false;
   if (!eventTimestamp) return false;
   const eventMs = Date.parse(eventTimestamp);
   if (!Number.isFinite(eventMs)) return false;

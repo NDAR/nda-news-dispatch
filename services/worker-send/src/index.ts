@@ -32,11 +32,20 @@ interface SendJob {
   test?: boolean;
   subject?: string;
   html?: string;
+  /** Resolved From/Reply-To for test sends — they have no campaign META
+   *  row to snapshot onto, so the API attaches them to the job itself. */
+  from?: string;
+  replyTo?: string;
 }
 
 interface CampaignContent {
   subject: string;
   html: string;
+  /** Snapshotted at draft → queueing transition. Undefined for any campaign
+   *  drafted before this feature shipped — falls back to the env
+   *  FROM_ADDRESS at the SES call site. */
+  fromEmail?: string;
+  replyTo?: string;
 }
 
 const CAMPAIGN_TTL_MS = 60_000;
@@ -53,6 +62,8 @@ async function loadCampaignContent(campaignId: string): Promise<CampaignContent>
   const content: CampaignContent = {
     subject: typeof res.Item.subject === 'string' ? res.Item.subject : '',
     html: typeof res.Item.html === 'string' ? res.Item.html : '',
+    fromEmail: typeof res.Item.fromEmail === 'string' ? res.Item.fromEmail : undefined,
+    replyTo: typeof res.Item.replyTo === 'string' ? res.Item.replyTo : undefined,
   };
   cachedCampaigns.set(campaignId, { at: now, content });
   return content;
@@ -82,13 +93,27 @@ async function processRecord(record: SQSRecord): Promise<void> {
   const job = JSON.parse(record.body) as SendJob;
   let subject: string;
   let html: string;
+  // Resolution precedence for the outbound headers, in order:
+  //   1. Test send — job.from / job.replyTo (attached by the API at enqueue
+  //      time, since test sends have no campaign META row).
+  //   2. Real send — META.fromEmail / META.replyTo, snapshotted by the API
+  //      at the draft → queueing transition.
+  //   3. Final fallback — the deploy-time env FROM_ADDRESS (for any legacy
+  //      campaign drafted before this feature shipped, with no META.fromEmail
+  //      yet, and no Reply-To).
+  let fromEmail: string;
+  let replyTo: string | undefined;
   if (job.test) {
     subject = job.subject ?? '';
     html = job.html ?? '';
+    fromEmail = job.from || FROM_ADDRESS;
+    replyTo = job.replyTo || undefined;
   } else {
     const content = await loadCampaignContent(job.campaignId);
     subject = content.subject;
     html = content.html;
+    fromEmail = content.fromEmail || FROM_ADDRESS;
+    replyTo = content.replyTo || undefined;
   }
   const token = createUnsubscribeToken(UNSUB_SECRET, job.campaignId, job.email);
   const unsubUrl = `${PUBLIC_BASE_URL}/public/u?c=${encodeURIComponent(job.campaignId)}&e=${encodeURIComponent(
@@ -122,8 +147,9 @@ async function processRecord(record: SQSRecord): Promise<void> {
 
   const res = await ses.send(
     new SendEmailCommand({
-      FromEmailAddress: FROM_ADDRESS,
+      FromEmailAddress: fromEmail,
       Destination: { ToAddresses: [job.email] },
+      ReplyToAddresses: replyTo ? [replyTo] : undefined,
       ConfigurationSetName: CONFIG_SET_NAME,
       EmailTags: [
         { Name: 'campaign-id', Value: job.campaignId },

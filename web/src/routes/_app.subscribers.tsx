@@ -21,6 +21,7 @@ import {
   type ImportFailure,
   type ImportJob,
   type NewsletterType,
+  type TagStrategy,
   type Suppression,
   type SuppressionScope,
 } from '../api/endpoints';
@@ -193,8 +194,13 @@ function SubscribersPage() {
   const [addOpen, setAddOpen] = useState(false);
 
   const addMut = useMutation({
-    mutationFn: (input: { email: string; name: string; org?: string; tags: string[] }) =>
-      upsertContact(input),
+    mutationFn: (input: {
+      email: string;
+      name: string;
+      org?: string;
+      tags: string[];
+      tagStrategy: TagStrategy;
+    }) => upsertContact(input),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['contacts'] });
       qc.invalidateQueries({ queryKey: ['admin-tags'] });
@@ -275,13 +281,14 @@ function SubscribersPage() {
     },
   });
 
-  const onUpload = async (file: File, assignTags: string[]) => {
+  const onUpload = async (file: File, assignTags: string[], tagStrategy: TagStrategy) => {
     setUploading(true);
     setUploadStatus('Requesting upload URL…');
     try {
       const { importId: id, uploadUrl } = await createImport({
         filename: file.name,
         assignTags,
+        tagStrategy,
       });
       setUploadStatus('Uploading…');
       await uploadCsv(uploadUrl, file);
@@ -1635,12 +1642,22 @@ function AddSubscriberModal({
   submitting: boolean;
   error?: Error;
   onClose: () => void;
-  onSubmit: (input: { email: string; name: string; org?: string; tags: string[] }) => void;
+  onSubmit: (input: {
+    email: string;
+    name: string;
+    org?: string;
+    tags: string[];
+    tagStrategy: TagStrategy;
+  }) => void;
 }) {
   const [email, setEmail] = useState('');
   const [name, setName] = useState('');
   const [org, setOrg] = useState('');
   const [tags, setTags] = useState<string[]>([]);
+  // Default to `augment` so re-adding an existing contact never
+  // silently drops tags the operator didn't include. Matches the CSV
+  // upload modal's default and copy.
+  const [tagStrategy, setTagStrategy] = useState<TagStrategy>('augment');
   const [draftTag, setDraftTag] = useState('');
   const [emailError, setEmailError] = useState<string | null>(null);
 
@@ -1682,6 +1699,7 @@ function AddSubscriberModal({
       name: name.trim() || cleanEmail.split('@')[0],
       org: org.trim() || undefined,
       tags,
+      tagStrategy,
     });
   };
 
@@ -1739,6 +1757,68 @@ function AddSubscriberModal({
           </div>
           <div>
             <div className="label">Tags</div>
+            <div
+              className="stack"
+              style={{
+                gap: 6,
+                padding: '8px 10px',
+                marginBottom: 8,
+                background: 'var(--paper-deep)',
+                border: '1px solid var(--rule-soft)',
+                borderRadius: 4,
+              }}
+            >
+              <label
+                className="row items-start gap-sm"
+                style={{ cursor: 'pointer', fontSize: 12, alignItems: 'flex-start' }}
+              >
+                <input
+                  type="radio"
+                  name="add-tag-strategy"
+                  value="augment"
+                  checked={tagStrategy === 'augment'}
+                  onChange={() => setTagStrategy('augment')}
+                  style={{ marginTop: 2 }}
+                />
+                <span>
+                  <strong>Augment</strong> existing tags
+                  <span className="muted" style={{ marginLeft: 6 }}>
+                    — if this email already exists, add these tags alongside their current ones.
+                  </span>
+                </span>
+              </label>
+              <label
+                className="row items-start gap-sm"
+                style={{ cursor: 'pointer', fontSize: 12, alignItems: 'flex-start' }}
+              >
+                <input
+                  type="radio"
+                  name="add-tag-strategy"
+                  value="replace"
+                  checked={tagStrategy === 'replace'}
+                  onChange={() => setTagStrategy('replace')}
+                  style={{ marginTop: 2 }}
+                />
+                <span>
+                  <strong>Replace</strong> existing tags
+                  <span className="muted" style={{ marginLeft: 6 }}>
+                    — if this email already exists, overwrite their tags with the ones below.
+                  </span>
+                </span>
+              </label>
+              {tagStrategy === 'replace' && tags.length === 0 && (
+                <div
+                  style={{
+                    color: 'var(--bad)',
+                    fontSize: 11.5,
+                    marginTop: 2,
+                    paddingLeft: 22,
+                  }}
+                >
+                  ⚠ No tags chosen — an existing contact with this email will have all of their tags removed.
+                </div>
+              )}
+            </div>
             <div className="stack" style={{ gap: 8 }}>
               {tags.length > 0 && (
                 <div className="row items-center" style={{ gap: 6, flexWrap: 'wrap' }}>
@@ -1847,10 +1927,11 @@ function UploadCsvModal({
   uploading: boolean;
   uploadStatus: string;
   onClose: () => void;
-  onUpload: (file: File, tags: string[]) => void;
+  onUpload: (file: File, tags: string[], tagStrategy: TagStrategy) => void;
 }) {
   const [file, setFile] = useState<File | null>(null);
   const [tags, setTags] = useState<string[]>([]);
+  const [tagStrategy, setTagStrategy] = useState<TagStrategy>('augment');
   const [draftTag, setDraftTag] = useState('');
   const [dragOver, setDragOver] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
@@ -1979,6 +2060,68 @@ function UploadCsvModal({
             <div className="muted" style={{ fontSize: 11.5, marginBottom: 10 }}>
               Optional. Tags help you target this group in the Send screen.
             </div>
+            <div
+              className="stack"
+              style={{
+                gap: 6,
+                padding: '8px 10px',
+                marginBottom: 10,
+                background: 'var(--paper-deep)',
+                border: '1px solid var(--rule-soft)',
+                borderRadius: 4,
+              }}
+            >
+              <label
+                className="row items-start gap-sm"
+                style={{ cursor: 'pointer', fontSize: 12, alignItems: 'flex-start' }}
+              >
+                <input
+                  type="radio"
+                  name="tag-strategy"
+                  value="augment"
+                  checked={tagStrategy === 'augment'}
+                  onChange={() => setTagStrategy('augment')}
+                  style={{ marginTop: 2 }}
+                />
+                <span>
+                  <strong>Augment</strong> existing tags
+                  <span className="muted" style={{ marginLeft: 6 }}>
+                    — for emails already on the list, add these tags alongside their current ones.
+                  </span>
+                </span>
+              </label>
+              <label
+                className="row items-start gap-sm"
+                style={{ cursor: 'pointer', fontSize: 12, alignItems: 'flex-start' }}
+              >
+                <input
+                  type="radio"
+                  name="tag-strategy"
+                  value="replace"
+                  checked={tagStrategy === 'replace'}
+                  onChange={() => setTagStrategy('replace')}
+                  style={{ marginTop: 2 }}
+                />
+                <span>
+                  <strong>Replace</strong> existing tags
+                  <span className="muted" style={{ marginLeft: 6 }}>
+                    — for emails already on the list, overwrite their tags with the ones below.
+                  </span>
+                </span>
+              </label>
+              {tagStrategy === 'replace' && tags.length === 0 && (
+                <div
+                  style={{
+                    color: 'var(--bad)',
+                    fontSize: 11.5,
+                    marginTop: 2,
+                    paddingLeft: 22,
+                  }}
+                >
+                  ⚠ No tags chosen — re-imported contacts will have all of their existing tags removed.
+                </div>
+              )}
+            </div>
             <div className="stack" style={{ gap: 8 }}>
               {tags.length > 0 && (
                 <div className="row items-center" style={{ gap: 6, flexWrap: 'wrap' }}>
@@ -2071,7 +2214,7 @@ function UploadCsvModal({
           </button>
           <button
             className="btn btn-accent"
-            onClick={() => file && onUpload(file, tags)}
+            onClick={() => file && onUpload(file, tags, tagStrategy)}
             disabled={!file || uploading}
           >
             {uploading

@@ -9,6 +9,7 @@ import {
   UpdateCommand,
   DeleteCommand,
 } from '@aws-sdk/lib-dynamodb';
+import { FROM_LOCAL_PART_RE, FROM_NAME_MAX, REPLY_TO_RE } from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -56,6 +57,11 @@ interface TypeInput {
    *  visitors can sign up for it themselves. Defaults to false (admins
    *  opt in explicitly per type). */
   publicSubscribable?: boolean;
+  /** Sender-identity overrides. Each field independently overrides the
+   *  org-wide default in Settings; an unset field inherits. */
+  fromName?: string;
+  fromLocalPart?: string;
+  replyTo?: string;
 }
 
 interface TypeRecord {
@@ -68,6 +74,9 @@ interface TypeRecord {
   defaultBodyHtml?: string;
   publicSubscribable?: boolean;
   archived?: boolean;
+  fromName?: string;
+  fromLocalPart?: string;
+  replyTo?: string;
   createdAt: string;
   createdBy?: string;
 }
@@ -157,6 +166,14 @@ async function updateType(id: string, body: TypeInput): Promise<TypeRecord> {
       body.publicSubscribable !== undefined
         ? body.publicSubscribable === true
         : existing.publicSubscribable,
+    fromName:
+      body.fromName !== undefined ? validateFromName(body.fromName) : existing.fromName,
+    fromLocalPart:
+      body.fromLocalPart !== undefined
+        ? validateFromLocalPart(body.fromLocalPart)
+        : existing.fromLocalPart,
+    replyTo:
+      body.replyTo !== undefined ? validateReplyTo(body.replyTo) : existing.replyTo,
   };
 
   // Sentinel rotation when renaming.
@@ -231,9 +248,46 @@ function normalizeInput(
     defaultSubjectPrefix: body.defaultSubjectPrefix?.trim() || undefined,
     defaultBodyHtml: validateBodyHtml(body.defaultBodyHtml),
     publicSubscribable: body.publicSubscribable === true,
+    fromName: validateFromName(body.fromName),
+    fromLocalPart: validateFromLocalPart(body.fromLocalPart),
+    replyTo: validateReplyTo(body.replyTo),
     createdAt,
     createdBy: claims.email ?? claims.sub,
   };
+}
+
+function validateFromName(v: string | undefined): string | undefined {
+  if (v === undefined) return undefined;
+  const trimmed = v.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > FROM_NAME_MAX) {
+    throw new HttpError(400, 'invalid-input', `fromName must be ≤ ${FROM_NAME_MAX} chars`);
+  }
+  return trimmed;
+}
+
+function validateFromLocalPart(v: string | undefined): string | undefined {
+  if (v === undefined) return undefined;
+  const trimmed = v.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  if (!FROM_LOCAL_PART_RE.test(trimmed)) {
+    throw new HttpError(
+      400,
+      'invalid-input',
+      'fromLocalPart must be lowercase letters, digits, dots, dashes, or underscores (≤ 64 chars)',
+    );
+  }
+  return trimmed;
+}
+
+function validateReplyTo(v: string | undefined): string | undefined {
+  if (v === undefined) return undefined;
+  const trimmed = v.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  if (!REPLY_TO_RE.test(trimmed)) {
+    throw new HttpError(400, 'invalid-input', 'replyTo must be a valid email address');
+  }
+  return trimmed;
 }
 
 function validateBodyHtml(html: string | undefined): string | undefined {

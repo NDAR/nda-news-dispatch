@@ -1,6 +1,7 @@
 import type { APIGatewayProxyHandler, APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { FROM_LOCAL_PART_RE, FROM_NAME_MAX, REPLY_TO_RE } from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -9,6 +10,10 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
 const TABLE = mustEnv('TABLE_NAME');
 const PK = 'ORG#default';
 const SK = 'SETTINGS';
+// Surface the sending domain in the read response so the Settings UI can
+// render the static `@<domain>` suffix next to the local-part input. The
+// admin Lambda doesn't itself send mail; this is purely informational.
+const SENDING_DOMAIN = process.env.SENDING_DOMAIN ?? '';
 
 const FOOTER_MAX = 20_000;
 const ADDRESS_MAX = 500;
@@ -37,30 +42,45 @@ interface SettingsInput {
   footerHtml?: string;
   senderName?: string;
   senderAddress?: string;
+  fromName?: string;
+  fromLocalPart?: string;
+  replyTo?: string;
 }
 
 interface SettingsRecord {
   footerHtml: string;
   senderName?: string;
   senderAddress?: string;
+  fromName?: string;
+  fromLocalPart?: string;
+  replyTo?: string;
   updatedAt?: string;
   updatedBy?: string;
 }
 
-async function readSettings(): Promise<SettingsRecord> {
+/** Adds sendingDomain to the read response so the UI knows the domain
+ *  the local-part will be appended to. Not persisted — it's an env value. */
+type SettingsResponse = SettingsRecord & { sendingDomain: string };
+
+async function readSettings(): Promise<SettingsResponse> {
   const res = await ddb.send(new GetCommand({ TableName: TABLE, Key: { PK, SK } }));
-  if (!res.Item) {
-    return { footerHtml: '' };
-  }
-  const { PK: _pk, SK: _sk, ...rest } = res.Item as Record<string, unknown>;
-  void _pk; void _sk;
-  return rest as SettingsRecord;
+  const base: SettingsRecord = res.Item
+    ? (() => {
+        const { PK: _pk, SK: _sk, ...rest } = res.Item as Record<string, unknown>;
+        void _pk; void _sk;
+        return rest as SettingsRecord;
+      })()
+    : { footerHtml: '' };
+  return { ...base, sendingDomain: SENDING_DOMAIN };
 }
 
-async function writeSettings(body: SettingsInput, claims: Claims): Promise<SettingsRecord> {
+async function writeSettings(body: SettingsInput, claims: Claims): Promise<SettingsResponse> {
   const footerHtml = (body.footerHtml ?? '').trim();
   const senderName = body.senderName?.trim() || undefined;
   const senderAddress = body.senderAddress?.trim() || undefined;
+  const fromName = body.fromName?.trim() || undefined;
+  const fromLocalPart = body.fromLocalPart?.trim().toLowerCase() || undefined;
+  const replyTo = body.replyTo?.trim().toLowerCase() || undefined;
 
   if (footerHtml.length > FOOTER_MAX) {
     throw new HttpError(400, 'invalid-input', `footerHtml must be ≤ ${FOOTER_MAX} chars`);
@@ -70,6 +90,19 @@ async function writeSettings(body: SettingsInput, claims: Claims): Promise<Setti
   }
   if (senderAddress && senderAddress.length > ADDRESS_MAX) {
     throw new HttpError(400, 'invalid-input', `senderAddress must be ≤ ${ADDRESS_MAX} chars`);
+  }
+  if (fromName && fromName.length > FROM_NAME_MAX) {
+    throw new HttpError(400, 'invalid-input', `fromName must be ≤ ${FROM_NAME_MAX} chars`);
+  }
+  if (fromLocalPart && !FROM_LOCAL_PART_RE.test(fromLocalPart)) {
+    throw new HttpError(
+      400,
+      'invalid-input',
+      'fromLocalPart must be lowercase letters, digits, dots, dashes, or underscores (≤ 64 chars)',
+    );
+  }
+  if (replyTo && !REPLY_TO_RE.test(replyTo)) {
+    throw new HttpError(400, 'invalid-input', `replyTo must be a valid email address`);
   }
   // Compliance: refuse to save a footer body without a physical address.
   // The worker relies on senderAddress always being present once anything is saved.
@@ -85,6 +118,9 @@ async function writeSettings(body: SettingsInput, claims: Claims): Promise<Setti
     footerHtml,
     senderName,
     senderAddress,
+    fromName,
+    fromLocalPart,
+    replyTo,
     updatedAt: new Date().toISOString(),
     updatedBy: claims.email ?? claims.sub,
   };
@@ -95,7 +131,7 @@ async function writeSettings(body: SettingsInput, claims: Claims): Promise<Setti
       Item: { PK, SK, ...record },
     }),
   );
-  return record;
+  return { ...record, sendingDomain: SENDING_DOMAIN };
 }
 
 function parseBody(event: APIGatewayProxyEvent): SettingsInput {

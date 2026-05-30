@@ -41,35 +41,76 @@ export async function batchWriteAll(
   }
 }
 
+/**
+ * Fan-out concurrency for the parallel-chunk loop. DynamoDB BatchGetItem
+ * caps each call at 100 keys, so we have to chunk regardless; the only
+ * question is whether the chunks run sequentially or in waves.
+ *
+ * The original implementation ran one chunk at a time, which meant a
+ * 45 K-row materialization took ~450 sequential round-trips ≈ 13 s. With
+ * 8-way fan-out the same workload finishes in ~56 waves, which is
+ * roughly an order of magnitude faster. Higher concurrency would help
+ * proportionally but increases the risk of provisioned-throughput
+ * throttling on the underlying table, especially when callers are
+ * already running other DDB work in parallel.
+ *
+ * The output is a flat array of results across all chunks. We do NOT
+ * guarantee output order matches input order — every caller in this
+ * repo indexes results by email (or another PK field) into a Map, so
+ * ordering wasn't relied on even when the loop was sequential.
+ */
+const BATCH_GET_CONCURRENCY = 8;
+
 export async function batchGetAll<T extends Record<string, unknown>>(
   ddb: DynamoDBDocumentClient,
   tableName: string,
   keys: Record<string, unknown>[],
 ): Promise<T[]> {
-  const out: T[] = [];
+  if (keys.length === 0) return [];
+
+  const chunks: Record<string, unknown>[][] = [];
   for (let i = 0; i < keys.length; i += 100) {
-    let pending = keys.slice(i, i + 100);
-    if (pending.length === 0) continue;
-    for (let attempt = 0; attempt <= MAX_BATCH_RETRIES; attempt++) {
-      const res = await ddb.send(
-        new BatchGetCommand({
-          RequestItems: {
-            [tableName]: {
-              Keys: pending,
-            },
-          },
-        }),
-      );
-      out.push(...((res.Responses?.[tableName] ?? []) as T[]));
-      pending = (res.UnprocessedKeys?.[tableName]?.Keys ?? []) as typeof pending;
-      if (pending.length === 0) break;
-      if (attempt === MAX_BATCH_RETRIES) {
-        throw new Error(`BatchGet exhausted retries with ${pending.length} unprocessed keys`);
-      }
-      await sleep(backoffMs(attempt));
-    }
+    chunks.push(keys.slice(i, i + 100));
+  }
+
+  const out: T[] = [];
+  for (let i = 0; i < chunks.length; i += BATCH_GET_CONCURRENCY) {
+    const wave = chunks.slice(i, i + BATCH_GET_CONCURRENCY);
+    const waveResults = await Promise.all(wave.map((chunk) => doBatchGet<T>(ddb, tableName, chunk)));
+    for (const arr of waveResults) out.push(...arr);
   }
   return out;
+}
+
+/**
+ * Runs one BatchGetItem of up to 100 keys, retrying any
+ * `UnprocessedKeys` with exponential backoff. Inlined per-chunk so each
+ * parallel worker can independently resolve its own retries without
+ * coordinating with siblings — UnprocessedKeys is per-call, not
+ * per-table-wide.
+ */
+async function doBatchGet<T extends Record<string, unknown>>(
+  ddb: DynamoDBDocumentClient,
+  tableName: string,
+  chunk: Record<string, unknown>[],
+): Promise<T[]> {
+  const local: T[] = [];
+  let pending = chunk;
+  for (let attempt = 0; attempt <= MAX_BATCH_RETRIES; attempt++) {
+    const res = await ddb.send(
+      new BatchGetCommand({
+        RequestItems: { [tableName]: { Keys: pending } },
+      }),
+    );
+    local.push(...((res.Responses?.[tableName] ?? []) as T[]));
+    pending = (res.UnprocessedKeys?.[tableName]?.Keys ?? []) as typeof pending;
+    if (pending.length === 0) return local;
+    if (attempt === MAX_BATCH_RETRIES) {
+      throw new Error(`BatchGet exhausted retries with ${pending.length} unprocessed keys`);
+    }
+    await sleep(backoffMs(attempt));
+  }
+  return local;
 }
 
 export async function sendMessageBatchAll<T extends SendMessageBatchRequestEntry>(

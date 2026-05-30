@@ -31,6 +31,9 @@ interface SentInfo {
   when: WhenMode;
   scheduleDate?: string;
   scheduleTime?: string;
+  /** True when the send was a dry-run — no email actually left SES. The
+   *  confirmation modal swaps copy to make this obvious. */
+  simulate?: boolean;
 }
 
 function SendPage() {
@@ -121,28 +124,49 @@ function SendPage() {
 
   // Live audience preview — re-runs whenever the filter changes. Debounced
   // 350ms so dragging through tag chips doesn't flood the API.
+  //
+  // Split into two queries so the headline number doesn't wait on the
+  // slow tag-breakdown computation. The fast call returns count, total,
+  // and an 8-row sample via a single Select=COUNT-style sweep (no
+  // per-profile materialization). The slow call layers in topTags by
+  // materializing every matched profile — only needed for the "Tag
+  // breakdown" pills, which the UI hides until they're ready.
   const debouncedFilter = useDebouncedValue(
     { tags: selectedTags, excludeTags, tagMode },
     350,
   );
   const { data: audience, isFetching: previewLoading } = useQuery<AudiencePreview>({
-    queryKey: ['audience-preview', debouncedFilter],
+    queryKey: ['audience-preview', 'fast', debouncedFilter],
     queryFn: () => previewAudience(debouncedFilter),
     placeholderData: (prev) => prev,
+  });
+  // Deliberately NO `placeholderData` on the slow query so topTags clears
+  // between filter changes — if the user picks a different tag we don't
+  // want to keep showing a breakdown that doesn't match the new fast
+  // count. The Tag-breakdown section in the UI shows a loading row
+  // instead while this query is in flight.
+  const { data: audienceFull, isFetching: topTagsLoading } = useQuery<AudiencePreview>({
+    queryKey: ['audience-preview', 'full', debouncedFilter],
+    queryFn: () => previewAudience({ ...debouncedFilter, topTags: true }),
   });
   const recipientCount = audience?.count ?? 0;
   const total = audience?.total ?? 0;
   const topTags = useMemo<[string, number][]>(
-    () => (audience?.topTags ?? []).map((t) => [t.tag, t.count]),
-    [audience],
+    () => (audienceFull?.topTags ?? []).map((t) => [t.tag, t.count]),
+    [audienceFull],
   );
   const sample = audience?.sample ?? [];
 
+  // Single mutation handles real-send, scheduled-send, and dry-run. The
+  // `simulate` arg short-circuits the schedule path (the API enforces this
+  // too) and tells the API to walk the no-SES branch.
   const sendMut = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (opts: { simulate?: boolean } = {}) => {
       if (!template) throw new Error('Pick a template');
       const scheduleAt =
-        when === 'schedule' ? scheduleAtISO(scheduleDate, scheduleTime, scheduleTz) : undefined;
+        when === 'schedule' && !opts.simulate
+          ? scheduleAtISO(scheduleDate, scheduleTime, scheduleTz)
+          : undefined;
       const c = await createCampaign({
         templateId: template.id,
         name: campaignName || template.title,
@@ -152,20 +176,24 @@ function SendPage() {
         tags: selectedTags,
         excludeTags,
         scheduleAt,
+        simulate: opts.simulate,
       });
-      return { campaignId: c.id, enqueued: r.enqueued };
+      return { campaignId: c.id, enqueued: r.enqueued, simulate: !!opts.simulate };
     },
     onSuccess: (r) => {
       setSent({
         campaignId: r.campaignId,
         enqueued: r.enqueued,
-        when,
-        scheduleDate: when === 'schedule' ? scheduleDate : undefined,
-        scheduleTime: when === 'schedule' ? scheduleTime : undefined,
+        when: r.simulate ? 'now' : when,
+        scheduleDate: !r.simulate && when === 'schedule' ? scheduleDate : undefined,
+        scheduleTime: !r.simulate && when === 'schedule' ? scheduleTime : undefined,
+        simulate: r.simulate,
       });
       qc.invalidateQueries({ queryKey: ['campaigns'] });
     },
   });
+  const [simulateConfirmOpen, setSimulateConfirmOpen] = useState(false);
+  const [sendConfirmOpen, setSendConfirmOpen] = useState(false);
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -261,6 +289,7 @@ function SendPage() {
             recipientCount={recipientCount}
             activeTotal={total}
             topTags={topTags}
+            topTagsLoading={topTagsLoading}
             tagsLoading={tagsLoading}
             previewLoading={previewLoading}
           />
@@ -321,24 +350,68 @@ function SendPage() {
               onClick={() => setStep((step + 1) as Step)}
             />
           ) : (
-            <button
-              className="btn btn-accent"
-              onClick={() => sendMut.mutate()}
-              disabled={
-                sendMut.isPending ||
-                recipientCount === 0 ||
-                (when === 'schedule' && !isValidScheduleTime(scheduleDate, scheduleTime, scheduleTz))
-              }
-            >
-              {sendMut.isPending
-                ? when === 'now' ? 'Sending…' : 'Scheduling…'
-                : when === 'now'
-                  ? `Send to ${fmt(recipientCount)} subscriber${recipientCount === 1 ? '' : 's'}`
-                  : 'Schedule send'}
-            </button>
+            <div className="row items-center gap-sm">
+              <button
+                className="btn btn-sm"
+                onClick={() => setSimulateConfirmOpen(true)}
+                disabled={sendMut.isPending || recipientCount === 0}
+                title={
+                  recipientCount === 0
+                    ? 'No recipients match the current filter'
+                    : 'Run a dry-run: materializes the audience but does NOT send any email'
+                }
+              >
+                {sendMut.isPending && sendMut.variables?.simulate
+                  ? 'Simulating…'
+                  : 'Simulate (dry-run)'}
+              </button>
+              <button
+                className="btn btn-accent"
+                onClick={() => setSendConfirmOpen(true)}
+                disabled={
+                  sendMut.isPending ||
+                  recipientCount === 0 ||
+                  (when === 'schedule' && !isValidScheduleTime(scheduleDate, scheduleTime, scheduleTz))
+                }
+              >
+                {sendMut.isPending && !sendMut.variables?.simulate
+                  ? when === 'now' ? 'Sending…' : 'Scheduling…'
+                  : when === 'now'
+                    ? `Send to ${fmt(recipientCount)} subscriber${recipientCount === 1 ? '' : 's'}`
+                    : 'Schedule send'}
+              </button>
+            </div>
           )}
         </div>
       </div>
+
+      {simulateConfirmOpen && (
+        <SimulateConfirmModal
+          recipientCount={recipientCount}
+          pending={sendMut.isPending}
+          onCancel={() => setSimulateConfirmOpen(false)}
+          onConfirm={() => {
+            setSimulateConfirmOpen(false);
+            sendMut.mutate({ simulate: true });
+          }}
+        />
+      )}
+
+      {sendConfirmOpen && (
+        <SendConfirmModal
+          recipientCount={recipientCount}
+          when={when}
+          scheduleDate={when === 'schedule' ? scheduleDate : undefined}
+          scheduleTime={when === 'schedule' ? scheduleTime : undefined}
+          scheduleTz={when === 'schedule' ? scheduleTz : undefined}
+          pending={sendMut.isPending}
+          onCancel={() => setSendConfirmOpen(false)}
+          onConfirm={() => {
+            setSendConfirmOpen(false);
+            sendMut.mutate({});
+          }}
+        />
+      )}
 
       {sent && (
         <SentModal
@@ -534,6 +607,7 @@ function RecipientsStep(props: {
   recipientCount: number;
   activeTotal: number;
   topTags: [string, number][];
+  topTagsLoading: boolean;
   tagsLoading: boolean;
   previewLoading: boolean;
 }) {
@@ -542,7 +616,7 @@ function RecipientsStep(props: {
     selectedTags, setSelectedTags,
     excludeTags, setExcludeTags,
     knownTags, sample, recipientCount, activeTotal, topTags,
-    tagsLoading, previewLoading,
+    topTagsLoading, tagsLoading, previewLoading,
   } = props;
 
   return (
@@ -609,31 +683,67 @@ function RecipientsStep(props: {
               </div>
             </div>
           </div>
-          {topTags.length > 0 && (
+          {/* Show the breakdown section when we either have data or are
+              fetching for a non-empty audience. Tag breakdown is computed
+              by the slow audience-preview query, which lags behind the
+              fast count by a second or two; we render skeleton pills in
+              the meantime so the layout doesn't pop in late. */}
+          {(topTags.length > 0 || (topTagsLoading && recipientCount > 0)) && (
             <>
-              <div className="eyebrow" style={{ marginBottom: 8 }}>
-                Tag breakdown
-              </div>
-              <div className="row items-center" style={{ gap: 6, flexWrap: 'wrap' }}>
-                {topTags.map(([tag, n]) => (
-                  <div
-                    key={tag}
-                    className="row items-center gap-sm"
+              <div
+                className="eyebrow"
+                style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}
+              >
+                <span>Tag breakdown</span>
+                {topTagsLoading && (
+                  <span
+                    className="muted"
                     style={{
-                      padding: '3px 9px 3px 9px',
-                      background: 'var(--paper)',
-                      border: '1px solid var(--rule)',
-                      borderRadius: 99,
-                      fontSize: 11.5,
+                      fontSize: 10,
+                      letterSpacing: 0,
+                      textTransform: 'none',
+                      fontWeight: 'normal',
+                      fontStyle: 'italic',
                     }}
                   >
-                    <TagPill tag={tag} />
-                    <span className="mono-sm" style={{ fontWeight: 500 }}>
-                      {fmt(n)}
-                    </span>
-                  </div>
-                ))}
+                    computing…
+                  </span>
+                )}
               </div>
+              {topTags.length > 0 ? (
+                <div
+                  className="row items-center"
+                  style={{
+                    gap: 6,
+                    flexWrap: 'wrap',
+                    // Slight fade while a refresh is in flight so the user
+                    // can see the displayed counts are about to update.
+                    opacity: topTagsLoading ? 0.5 : 1,
+                    transition: 'opacity 0.18s',
+                  }}
+                >
+                  {topTags.map(([tag, n]) => (
+                    <div
+                      key={tag}
+                      className="row items-center gap-sm"
+                      style={{
+                        padding: '3px 9px 3px 9px',
+                        background: 'var(--paper)',
+                        border: '1px solid var(--rule)',
+                        borderRadius: 99,
+                        fontSize: 11.5,
+                      }}
+                    >
+                      <TagPill tag={tag} />
+                      <span className="mono-sm" style={{ fontWeight: 500 }}>
+                        {fmt(n)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <TagBreakdownSkeleton />
+              )}
             </>
           )}
           {sample.length > 0 && (
@@ -674,6 +784,36 @@ function RecipientsStep(props: {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Skeleton placeholder for the Tag breakdown while the slow audience
+ * preview is in flight. Mirrors the shape of the real pills (rounded,
+ * border, comparable height) so the surrounding layout doesn't shift
+ * when real data arrives. The shimmer is driven by the global
+ * `dispatch-skeleton-pulse` keyframes in styles.css.
+ */
+function TagBreakdownSkeleton() {
+  // Varied widths so the placeholder reads as "tag name + number"
+  // rather than as a row of identical bars.
+  const widths = [88, 64, 76, 96, 70];
+  return (
+    <div className="row items-center" style={{ gap: 6, flexWrap: 'wrap' }}>
+      {widths.map((w, i) => (
+        <div
+          key={i}
+          className="skeleton-pulse"
+          style={{
+            width: w,
+            height: 22,
+            borderRadius: 99,
+            border: '1px solid var(--rule-soft)',
+            background: 'var(--paper-deep)',
+          }}
+        />
+      ))}
     </div>
   );
 }
@@ -1081,10 +1221,212 @@ function TagFilter({
   );
 }
 
+// ── Send confirmation modal (type-to-confirm) ─────────────────────────────
+
+/**
+ * Type-"send"-to-confirm gate on the primary action. The audience can be
+ * tens of thousands of subscribers; a misclick at this point can't be
+ * undone (recipients have already received the email by the time the
+ * operator realizes), so we want a deliberate keystroke confirmation, not
+ * just a button click.
+ */
+function SendConfirmModal({
+  recipientCount,
+  when,
+  scheduleDate,
+  scheduleTime,
+  scheduleTz,
+  pending,
+  onCancel,
+  onConfirm,
+}: {
+  recipientCount: number;
+  when: WhenMode;
+  scheduleDate?: string;
+  scheduleTime?: string;
+  scheduleTz?: string;
+  pending: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const [typed, setTyped] = useState('');
+  const matches = typed.trim().toLowerCase() === 'send';
+  const isScheduled = when === 'schedule';
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !pending) onCancel();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onCancel, pending]);
+
+  return (
+    <div className="modal-backdrop" onClick={pending ? undefined : onCancel}>
+      <div
+        className="modal"
+        onClick={(e) => e.stopPropagation()}
+        style={{ maxWidth: 480 }}
+      >
+        <div className="modal-header">
+          <div className="eyebrow">Confirm</div>
+          <h2 className="serif" style={{ fontSize: 20, marginTop: 4 }}>
+            {isScheduled ? 'Schedule send?' : 'Send now?'}
+          </h2>
+        </div>
+        <div className="modal-body" style={{ padding: '8px 20px 12px' }}>
+          <p style={{ fontSize: 14, lineHeight: 1.5 }}>
+            You're about to {isScheduled ? 'schedule a real send to' : 'send to'}{' '}
+            <strong>{fmt(recipientCount)}</strong> subscriber
+            {recipientCount === 1 ? '' : 's'}.{' '}
+            {isScheduled && scheduleDate && scheduleTime ? (
+              <>
+                Delivery on <strong>{fmtDate(scheduleDate)}</strong> at{' '}
+                <strong>{scheduleTime}</strong>
+                {scheduleTz ? ` (${scheduleTz})` : ''}.
+              </>
+            ) : (
+              <>This will go out immediately and cannot be recalled.</>
+            )}
+          </p>
+          <p
+            className="muted"
+            style={{ fontSize: 12.5, marginTop: 10 }}
+          >
+            Want to verify the recipient list first? Cancel and click{' '}
+            <em>Simulate (dry-run)</em> instead.
+          </p>
+          <div style={{ marginTop: 16 }}>
+            <label
+              htmlFor="send-confirm-input"
+              className="label"
+              style={{ display: 'block', marginBottom: 6 }}
+            >
+              Type <code style={chipCode()}>send</code> to confirm
+            </label>
+            <input
+              id="send-confirm-input"
+              autoFocus
+              className="input"
+              value={typed}
+              onChange={(e) => setTyped(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && matches && !pending) onConfirm();
+              }}
+              placeholder="send"
+              disabled={pending}
+              autoComplete="off"
+              spellCheck={false}
+              style={{ width: '100%', fontFamily: 'var(--mono, monospace)' }}
+            />
+          </div>
+        </div>
+        <div className="modal-footer" style={{ justifyContent: 'flex-end', gap: 8 }}>
+          <button className="btn btn-sm" onClick={onCancel} disabled={pending}>
+            Cancel
+          </button>
+          <button
+            className="btn btn-sm btn-accent"
+            onClick={onConfirm}
+            disabled={!matches || pending}
+          >
+            {pending
+              ? isScheduled ? 'Scheduling…' : 'Sending…'
+              : isScheduled ? 'Schedule send' : `Send to ${fmt(recipientCount)}`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function chipCode(): React.CSSProperties {
+  return {
+    padding: '1px 6px',
+    background: 'var(--paper-deep)',
+    border: '1px solid var(--rule-soft, #e5e5e5)',
+    borderRadius: 4,
+    fontFamily: 'var(--mono, monospace)',
+    fontSize: 12,
+  };
+}
+
+// ── Simulate confirmation modal ────────────────────────────────────────────
+
+function SimulateConfirmModal({
+  recipientCount,
+  pending,
+  onCancel,
+  onConfirm,
+}: {
+  recipientCount: number;
+  pending: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !pending) onCancel();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onCancel, pending]);
+
+  return (
+    <div className="modal-backdrop" onClick={pending ? undefined : onCancel}>
+      <div
+        className="modal"
+        onClick={(e) => e.stopPropagation()}
+        style={{ maxWidth: 460 }}
+      >
+        <div className="modal-header">
+          <div className="eyebrow">Dry-run</div>
+          <h2 className="serif" style={{ fontSize: 20, marginTop: 4 }}>
+            Simulate this send?
+          </h2>
+        </div>
+        <div className="modal-body" style={{ padding: '8px 20px 12px' }}>
+          <p className="muted" style={{ fontSize: 13.5, lineHeight: 1.5 }}>
+            We'll resolve the audience exactly as a real send would and write
+            recipient rows so you can inspect the result, but{' '}
+            <strong>no email will be sent</strong>. The campaign appears
+            under <strong>History → Dry-runs</strong> and does not count
+            toward engagement metrics.
+          </p>
+          <p style={{ fontSize: 13, marginTop: 12 }}>
+            Recipient count at this moment:{' '}
+            <strong>{fmt(recipientCount)}</strong>.
+          </p>
+        </div>
+        <div className="modal-footer" style={{ justifyContent: 'flex-end', gap: 8 }}>
+          <button className="btn btn-sm" onClick={onCancel} disabled={pending}>
+            Cancel
+          </button>
+          <button
+            className="btn btn-sm btn-primary"
+            onClick={onConfirm}
+            disabled={pending}
+          >
+            {pending ? 'Simulating…' : 'Run dry-run'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Sent confirmation modal ────────────────────────────────────────────────
 
 function SentModal({ info, onClose }: { info: SentInfo; onClose: () => void }) {
   const isScheduled = info.when === 'schedule';
+  const isSimulated = !!info.simulate;
+  // Three visual states: simulated (slate), scheduled (warm yellow), real (green).
+  const palette = isSimulated
+    ? { bg: 'oklch(0.95 0.02 250)', fg: 'oklch(0.40 0.06 250)', icon: '🧪' }
+    : isScheduled
+      ? { bg: 'oklch(0.95 0.04 75)', fg: 'oklch(0.42 0.11 75)', icon: '📅' }
+      : { bg: 'oklch(0.95 0.04 145)', fg: 'oklch(0.42 0.10 145)', icon: '✓' };
+  const title = isSimulated ? 'Dry-run complete' : isScheduled ? 'Scheduled' : 'On its way';
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -1094,8 +1436,8 @@ function SentModal({ info, onClose }: { info: SentInfo; onClose: () => void }) {
               width: 54,
               height: 54,
               borderRadius: '50%',
-              background: isScheduled ? 'oklch(0.95 0.04 75)' : 'oklch(0.95 0.04 145)',
-              color: isScheduled ? 'oklch(0.42 0.11 75)' : 'oklch(0.42 0.10 145)',
+              background: palette.bg,
+              color: palette.fg,
               margin: '0 auto 18px',
               display: 'grid',
               placeItems: 'center',
@@ -1103,13 +1445,19 @@ function SentModal({ info, onClose }: { info: SentInfo; onClose: () => void }) {
               fontFamily: 'var(--serif)',
             }}
           >
-            {isScheduled ? '📅' : '✓'}
+            {palette.icon}
           </div>
           <h2 className="serif" style={{ fontSize: 24 }}>
-            {isScheduled ? 'Scheduled' : 'On its way'}
+            {title}
           </h2>
           <p className="muted" style={{ fontSize: 14, marginTop: 8 }}>
-            {isScheduled ? (
+            {isSimulated ? (
+              <>
+                No email was sent. The simulated campaign is on the
+                <strong> Dry-runs</strong> tab of History — open it to inspect
+                the resolved recipient list.
+              </>
+            ) : isScheduled ? (
               <>
                 Your newsletter will be delivered on <strong>{fmtDate(info.scheduleDate ?? '')}</strong>{' '}
                 at <strong>{info.scheduleTime} ET</strong>.

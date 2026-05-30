@@ -64,7 +64,7 @@ async function processRecord(record: SQSRecord): Promise<void> {
   if (!meta.Item) throw new Error(`campaign ${id} not found`);
 
   const status = String(meta.Item.status ?? '');
-  if (status === 'queued' || status === 'sending') {
+  if (status === 'queued' || status === 'sending' || status === 'simulated') {
     // Either a duplicate enqueue trigger or a successful prior run — skip.
     console.warn(JSON.stringify({ level: 'warn', msg: 'enqueue-already-done', campaignId: id, status }));
     return;
@@ -77,6 +77,11 @@ async function processRecord(record: SQSRecord): Promise<void> {
   const tags = (meta.Item.tags as string[] | undefined) ?? [];
   const excludeTags = (meta.Item.excludeTags as string[] | undefined) ?? [];
   const typeId = typeof meta.Item.typeId === 'string' ? meta.Item.typeId : undefined;
+  // Dry-run flag persisted by the API at draft → queueing transition. When
+  // true, we still materialize the audience and write RCPT rows so the
+  // History page can show what *would* have shipped, but we skip the
+  // per-recipient SQS push — worker-send is never invoked for this campaign.
+  const simulated = meta.Item.simulated === true;
   const claimedAt = new Date().toISOString();
 
   try {
@@ -87,7 +92,16 @@ async function processRecord(record: SQSRecord): Promise<void> {
     }
 
     await createStatsRow(id);
-    await batchWriteAll(ddb, TABLE, buildRecipientRows(id, recipients, claimedAt));
+    await batchWriteAll(
+      ddb,
+      TABLE,
+      buildRecipientRows(id, recipients, claimedAt, simulated ? 'simulated' : 'pending'),
+    );
+    if (simulated) {
+      await markStatus(id, 'simulated', { sentAt: claimedAt, recipients: recipients.length });
+      console.log(JSON.stringify({ level: 'info', msg: 'enqueue-simulated', campaignId: id, recipients: recipients.length }));
+      return;
+    }
     const enqueued = await enqueueSendMessages(id, recipients);
     await markStatus(id, 'queued', { sentAt: claimedAt, recipients: recipients.length });
 
@@ -101,7 +115,7 @@ async function processRecord(record: SQSRecord): Promise<void> {
 
 async function markStatus(
   id: string,
-  status: 'queued' | 'failed',
+  status: 'queued' | 'failed' | 'simulated',
   extras: { sentAt?: string; recipients?: number; error?: string } = {},
 ): Promise<void> {
   const parts = ['#s = :s', 'GSI1PK = :gpk'];
@@ -144,6 +158,7 @@ function buildRecipientRows(
   campaignId: string,
   recipients: string[],
   queuedAt: string,
+  state: 'pending' | 'simulated' = 'pending',
 ): { PutRequest?: unknown; DeleteRequest?: unknown }[] {
   return recipients.map((email) => ({
     PutRequest: {
@@ -153,7 +168,7 @@ function buildRecipientRows(
         GSI1PK: `RCPT#${email}`,
         GSI1SK: campaignId,
         email,
-        state: 'pending',
+        state,
         queuedAt,
       },
     },

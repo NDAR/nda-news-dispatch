@@ -48,6 +48,11 @@ interface CreateImportInput {
   assignTags?: string[];
   /** @deprecated kept for backward compatibility with older clients */
   assignTag?: string;
+  /** How assignTags interact with existing contacts' tag sets.
+   *  - `augment` (default): merge — never lose an existing tag.
+   *  - `replace`: assignTags becomes the contact's full tag set,
+   *    removing any tags not in assignTags. */
+  tagStrategy?: 'augment' | 'replace';
 }
 
 async function createImport(input: CreateImportInput, claims: Claims): Promise<{
@@ -66,6 +71,10 @@ async function createImport(input: CreateImportInput, claims: Claims): Promise<{
   for (const t of assignTags) {
     if (!TAG_RE.test(t)) throw new HttpError(400, 'invalid-tag', `Invalid tag: ${t}`);
   }
+  // Default to `augment` so any client that doesn't send the field
+  // keeps the historical behavior (never lose tags on a re-import).
+  const tagStrategy: 'augment' | 'replace' =
+    input.tagStrategy === 'replace' ? 'replace' : 'augment';
   const importId = randomUUID();
   const key = `imports/${importId}.csv`;
   const now = new Date().toISOString();
@@ -82,6 +91,7 @@ async function createImport(input: CreateImportInput, claims: Claims): Promise<{
         key,
         filename: input.filename,
         assignTags,
+        tagStrategy,
         status: 'pending',
         counts: { total: 0, inserted: 0, updated: 0, suppressed: 0, invalid: 0 },
         createdAt: now,

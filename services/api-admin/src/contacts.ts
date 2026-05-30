@@ -59,6 +59,16 @@ interface ContactInput {
   org?: string;
   tags?: string[];
   status?: 'active' | 'unsubscribed' | 'bounced';
+  /** How the supplied `tags` interact with the existing contact's tag
+   *  set when the email already exists:
+   *  - `augment` (default): merge — never lose an existing tag.
+   *  - `replace`: tags becomes the contact's full set; anything
+   *    previously on the contact but not in `tags` is removed.
+   *  For brand-new contacts (no existing PROFILE row) both modes give
+   *  the same result. Only used by `upsertContact`. `patchContact`
+   *  ignores this field — it's a low-level edit endpoint where the
+   *  caller is expected to send the exact final set. */
+  tagStrategy?: 'augment' | 'replace';
 }
 
 interface Contact {
@@ -187,11 +197,22 @@ async function getContact(email: string): Promise<Contact> {
 
 async function upsertContact(input: ContactInput): Promise<Contact> {
   const email = validEmail(input.email);
-  const tags = validTags(input.tags);
+  const inputTags = validTags(input.tags);
+  // Default to `augment` so a re-add of an existing contact never
+  // silently strips tags the operator hadn't included. Matches the CSV
+  // upload's default. The Add-subscriber UI exposes this as a radio.
+  const tagStrategy: 'augment' | 'replace' =
+    input.tagStrategy === 'replace' ? 'replace' : 'augment';
   const now = new Date().toISOString();
   const existing = await ddb.send(
     new GetCommand({ TableName: TABLE, Key: { PK: `CONTACT#${email}`, SK: 'PROFILE' } }),
   );
+  const prevTags = (existing.Item?.tags as string[] | undefined) ?? [];
+  // For brand-new contacts (no existing row) both strategies collapse
+  // to `inputTags` — there's nothing to merge with or preserve.
+  const tags = tagStrategy === 'augment'
+    ? [...prevTags, ...inputTags.filter((t) => !prevTags.includes(t))]
+    : inputTags;
   const record: Contact = {
     email,
     name: input.name?.trim() || existing.Item?.name || email.split('@')[0],
@@ -201,7 +222,10 @@ async function upsertContact(input: ContactInput): Promise<Contact> {
     joined: (existing.Item?.joined as string | undefined) ?? now.slice(0, 10),
     updatedAt: now,
   };
-  await writeContact(record, (existing.Item?.tags as string[] | undefined) ?? []);
+  // writeContact already diffs prev vs new tags and emits the right
+  // mix of TAG-row Puts/Deletes — so the replace path naturally drops
+  // associations for tags removed from the set.
+  await writeContact(record, prevTags);
   return record;
 }
 

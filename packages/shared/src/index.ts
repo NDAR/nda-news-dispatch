@@ -7,3 +7,4 @@ export * from './unsubscribe';
 export * from './subscribe-token';
 export * from './viewInBrowser';
 export * from './footer';
+export * from './sender';

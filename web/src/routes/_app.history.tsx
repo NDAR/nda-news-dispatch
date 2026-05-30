@@ -2,10 +2,12 @@ import { createFileRoute, Outlet, useNavigate, useRouterState } from '@tanstack/
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useMemo, useState } from 'react';
 import {
+  archiveCampaign,
   cancelScheduledCampaign,
   listCampaigns,
   listTypes,
   previewAudience,
+  unarchiveCampaign,
   type Campaign,
   type CampaignStatus,
   type NewsletterType,
@@ -27,17 +29,24 @@ export const Route = createFileRoute('/_app/history')({
 // scope to one. The underlying CampaignStatus 'queued' is the storage state for
 // successfully-sent campaigns (there is no separate 'sent' status); we label it
 // "Sent" so users see their mental model, not the schema.
-type TabKey = 'all' | 'queued' | 'scheduled' | 'draft';
-const TABS: TabKey[] = ['all', 'queued', 'scheduled', 'draft'];
+//
+// Archived is a separate dimension from status — when active, it shows past
+// sends the operator has explicitly hidden from the default views. Archived
+// rows don't contribute to the engagement aggregates above the table.
+type TabKey = 'all' | 'queued' | 'scheduled' | 'draft' | 'simulated' | 'archived';
+const TABS: TabKey[] = ['all', 'queued', 'scheduled', 'draft', 'simulated', 'archived'];
 const TAB_LABEL: Record<TabKey, string> = {
   all: 'All',
   queued: 'Sent',
   scheduled: 'Scheduled',
   draft: 'Drafts',
+  simulated: 'Dry-runs',
+  archived: 'Archived',
 };
 // Statuses we fan out to populate the "All" tab. 'failed' is included so failed
 // campaigns aren't silently hidden, even though the legacy design only had four
-// visible tabs.
+// visible tabs. 'simulated' is deliberately omitted — dry-runs only show up
+// when the operator explicitly selects the Dry-runs tab.
 const ALL_STATUSES: CampaignStatus[] = ['queued', 'scheduled', 'draft', 'failed'];
 
 type SortKey = 'sentAt' | 'recipients' | 'openRate' | 'ctr';
@@ -76,10 +85,14 @@ function HistoryList() {
   // Fan out one query per status so the "All" tab has data and the metrics row
   // (which is always derived from queued/sent campaigns) can render no matter
   // which tab is selected. React Query dedupes by queryKey across re-renders.
+  //
+  // These queries pass `archived: false` so archived campaigns are excluded
+  // from every status tab. The aggregates row above the table sums these
+  // arrays, so it automatically excludes archived sends too.
   const statusQueries = useQueries({
     queries: ALL_STATUSES.map((s) => ({
-      queryKey: ['campaigns', s],
-      queryFn: () => listCampaigns(s),
+      queryKey: ['campaigns', s, 'active'],
+      queryFn: () => listCampaigns(s, { archived: false }),
       // Refetch the scheduled list periodically so rows disappear when the
       // dispatch worker fires; everything else is stable enough to skip polling.
       refetchInterval: s === 'scheduled' ? 30_000 : false,
@@ -89,8 +102,42 @@ function HistoryList() {
   ALL_STATUSES.forEach((s, i) => {
     byStatus.set(s, statusQueries[i]?.data?.items ?? []);
   });
-  const isLoading = statusQueries.some((q) => q.isLoading);
-  const error = statusQueries.find((q) => q.error)?.error as Error | undefined;
+
+  // Archived rows live in a parallel set that's only fetched when the
+  // operator switches to the Archived tab. The status partitioning is
+  // preserved (so a future "archived sent" vs "archived failed" split is
+  // trivial), but in practice the UI just flattens them together since
+  // archive is most useful for past sends.
+  const archivedQueries = useQueries({
+    queries: ALL_STATUSES.map((s) => ({
+      queryKey: ['campaigns', s, 'archived'],
+      queryFn: () => listCampaigns(s, { archived: true }),
+      enabled: tab === 'archived',
+    })),
+  });
+  const archivedByStatus = new Map<CampaignStatus, Campaign[]>();
+  ALL_STATUSES.forEach((s, i) => {
+    archivedByStatus.set(s, archivedQueries[i]?.data?.items ?? []);
+  });
+
+  // Dry-run campaigns live on their own status partition (`STATUS#simulated`)
+  // so they're cleanly excluded from every other tab and every aggregate.
+  // Only fetched when the operator opens the Dry-runs tab.
+  const simulatedQuery = useQuery({
+    queryKey: ['campaigns', 'simulated', 'active'],
+    queryFn: () => listCampaigns('simulated', { archived: false }),
+    enabled: tab === 'simulated',
+  });
+  const simulatedItems = simulatedQuery.data?.items ?? [];
+
+  const activeQueries =
+    tab === 'archived'
+      ? archivedQueries
+      : tab === 'simulated'
+        ? [simulatedQuery]
+        : statusQueries;
+  const isLoading = activeQueries.some((q) => q.isLoading);
+  const error = activeQueries.find((q) => q.error)?.error as Error | undefined;
 
   const cancelMut = useMutation({
     mutationFn: (id: string) => cancelScheduledCampaign(id),
@@ -98,6 +145,17 @@ function HistoryList() {
       // Both the scheduled and draft lists need to refresh.
       qc.invalidateQueries({ queryKey: ['campaigns'] });
     },
+  });
+
+  // Archive + unarchive share an invalidation pattern — touching either
+  // moves the row between the active and archived query buckets.
+  const archiveMut = useMutation({
+    mutationFn: (id: string) => archiveCampaign(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['campaigns'] }),
+  });
+  const unarchiveMut = useMutation({
+    mutationFn: (id: string) => unarchiveCampaign(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['campaigns'] }),
   });
 
   // Live audience preview for scheduled rows — these don't have `recipients`
@@ -127,14 +185,23 @@ function HistoryList() {
   });
 
   const tabItems = useMemo<Campaign[]>(() => {
+    if (tab === 'archived') {
+      // Flatten the archived buckets across statuses — most archived
+      // rows will be `queued` (past sends) but a failed send could also
+      // be archived.
+      return ALL_STATUSES.flatMap((s) => archivedByStatus.get(s) ?? []);
+    }
+    if (tab === 'simulated') {
+      return simulatedItems;
+    }
     if (tab === 'all') {
       return ALL_STATUSES.flatMap((s) => byStatus.get(s) ?? []);
     }
     return byStatus.get(tab) ?? [];
-    // byStatus is rebuilt every render; depending on the underlying query data
-    // is what actually changes the result.
+    // byStatus / archivedByStatus / simulatedItems are rebuilt every render;
+    // depending on the underlying query data is what actually changes the result.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, ...statusQueries.map((q) => q.data)]);
+  }, [tab, ...statusQueries.map((q) => q.data), ...archivedQueries.map((q) => q.data), simulatedQuery.data]);
 
   const visibleItems = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -353,34 +420,58 @@ function HistoryList() {
                     </td>
                   </tr>
                 )}
-                {visibleItems.map((c) => (
-                  <CampaignRow
-                    key={c.id}
-                    campaign={c}
-                    type={c.typeId ? typeById.get(c.typeId) : undefined}
-                    audiencePreview={previewByCampaign.get(c.id)}
-                    onClick={() =>
-                      navigate({
-                        to: '/history/$campaignId',
-                        params: { campaignId: c.id },
-                      })
-                    }
-                    onCancel={
-                      c.status === 'scheduled'
-                        ? () => {
-                            if (
-                              confirm(
-                                `Cancel scheduled send of "${c.name}"?\n\nThe campaign will revert to a draft.`,
-                              )
-                            ) {
-                              cancelMut.mutate(c.id);
+                {visibleItems.map((c) => {
+                  const isPastSend =
+                    c.status === 'queued' || c.status === 'sent' || c.status === 'failed';
+                  return (
+                    <CampaignRow
+                      key={c.id}
+                      campaign={c}
+                      type={c.typeId ? typeById.get(c.typeId) : undefined}
+                      audiencePreview={previewByCampaign.get(c.id)}
+                      onClick={() =>
+                        navigate({
+                          to: '/history/$campaignId',
+                          params: { campaignId: c.id },
+                        })
+                      }
+                      onCancel={
+                        c.status === 'scheduled'
+                          ? () => {
+                              if (
+                                confirm(
+                                  `Cancel scheduled send of "${c.name}"?\n\nThe campaign will revert to a draft.`,
+                                )
+                              ) {
+                                cancelMut.mutate(c.id);
+                              }
                             }
-                          }
-                        : undefined
-                    }
-                    cancelling={cancelMut.isPending && cancelMut.variables === c.id}
-                  />
-                ))}
+                          : undefined
+                      }
+                      cancelling={cancelMut.isPending && cancelMut.variables === c.id}
+                      onArchive={
+                        !c.archived && isPastSend
+                          ? () => {
+                              if (
+                                confirm(
+                                  `Archive "${c.name}"?\n\nIts engagement stats won't count toward the overall metrics. You can restore it from the Archived tab.`,
+                                )
+                              ) {
+                                archiveMut.mutate(c.id);
+                              }
+                            }
+                          : undefined
+                      }
+                      onUnarchive={
+                        c.archived ? () => unarchiveMut.mutate(c.id) : undefined
+                      }
+                      archivePending={
+                        (archiveMut.isPending && archiveMut.variables === c.id) ||
+                        (unarchiveMut.isPending && unarchiveMut.variables === c.id)
+                      }
+                    />
+                  );
+                })}
               </tbody>
             </table>
           )}
@@ -402,6 +493,9 @@ function CampaignRow({
   onClick,
   onCancel,
   cancelling,
+  onArchive,
+  onUnarchive,
+  archivePending,
 }: {
   campaign: Campaign;
   audiencePreview?: { count: number; loading: boolean };
@@ -409,11 +503,16 @@ function CampaignRow({
   onClick?: () => void;
   onCancel?: () => void;
   cancelling: boolean;
+  onArchive?: () => void;
+  onUnarchive?: () => void;
+  archivePending?: boolean;
 }) {
   const isSent = c.status === 'queued' || c.status === 'sending' || c.status === 'sent';
   const isScheduled = c.status === 'scheduled';
+  const isSimulated = c.status === 'simulated';
   // For sent rows show the actual recipient count; for scheduled rows show the
-  // live audience preview so the user knows what's about to go out.
+  // live audience preview so the user knows what's about to go out. Simulated
+  // rows also have a materialized recipient count — that's the whole point.
   const recipientCell = (() => {
     if (isScheduled) {
       if (audiencePreview?.loading) return <span className="muted">…</span>;
@@ -444,7 +543,7 @@ function CampaignRow({
         />
       </td>
       <td className="mono-sm muted">
-        {isSent && c.sentAt ? (
+        {(isSent || isSimulated) && c.sentAt ? (
           new Date(c.sentAt).toLocaleString(undefined, {
             month: 'short',
             day: 'numeric',
@@ -484,6 +583,24 @@ function CampaignRow({
       <td>
         <div className="row items-center gap-sm">
           <StatusPill status={c.status} />
+          {c.archived && (
+            <span
+              className="pill"
+              style={{
+                background: 'var(--paper-deep)',
+                color: 'var(--ink-mute)',
+                fontSize: 10,
+                padding: '2px 6px',
+              }}
+              title={
+                c.archivedAt
+                  ? `Archived ${new Date(c.archivedAt).toLocaleString()}`
+                  : 'Archived'
+              }
+            >
+              archived
+            </span>
+          )}
           {onCancel && (
             <button
               className="btn btn-sm"
@@ -495,6 +612,34 @@ function CampaignRow({
               }}
             >
               {cancelling ? '…' : 'Cancel'}
+            </button>
+          )}
+          {onArchive && (
+            <button
+              className="btn btn-sm btn-ghost"
+              style={{ fontSize: 11, padding: '2px 8px' }}
+              disabled={archivePending}
+              onClick={(e) => {
+                e.stopPropagation();
+                onArchive();
+              }}
+              title="Hide from default tabs and exclude from engagement aggregates"
+            >
+              {archivePending ? '…' : 'Archive'}
+            </button>
+          )}
+          {onUnarchive && (
+            <button
+              className="btn btn-sm btn-ghost"
+              style={{ fontSize: 11, padding: '2px 8px' }}
+              disabled={archivePending}
+              onClick={(e) => {
+                e.stopPropagation();
+                onUnarchive();
+              }}
+              title="Restore to the default tabs"
+            >
+              {archivePending ? '…' : 'Unarchive'}
             </button>
           )}
         </div>

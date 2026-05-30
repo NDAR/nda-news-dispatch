@@ -87,6 +87,7 @@ export class ApiStack extends Stack {
         TABLE_NAME: table.tableName,
         ARCHIVE_BUCKET: archiveBucket.bucketName,
         SEND_QUEUE_URL: sendQueue.queueUrl,
+        SENDING_DOMAIN: config.sendingDomain,
       },
     });
     table.grantReadWriteData(templatesFn);
@@ -138,6 +139,7 @@ export class ApiStack extends Stack {
         ENV_NAME: config.envName,
         TABLE_NAME: table.tableName,
         ENQUEUE_QUEUE_URL: enqueueQueue.queueUrl,
+        SENDING_DOMAIN: config.sendingDomain,
       },
     });
     table.grantReadWriteData(campaignsFn);
@@ -168,6 +170,7 @@ export class ApiStack extends Stack {
       environment: {
         ENV_NAME: config.envName,
         TABLE_NAME: table.tableName,
+        SENDING_DOMAIN: config.sendingDomain,
       },
     });
     table.grantReadWriteData(settingsFn);
@@ -429,6 +432,12 @@ export class ApiStack extends Stack {
       .addMethod('POST', new LambdaIntegration(campaignsFn), authOpts);
     campaignById
       .addResource('cancel')
+      .addMethod('POST', new LambdaIntegration(campaignsFn), authOpts);
+    campaignById
+      .addResource('archive')
+      .addMethod('POST', new LambdaIntegration(campaignsFn), authOpts);
+    campaignById
+      .addResource('unarchive')
       .addMethod('POST', new LambdaIntegration(campaignsFn), authOpts);
     campaignById
       .addResource('recipients')

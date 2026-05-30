@@ -48,11 +48,26 @@ export interface NewsletterType {
    *  can sign themselves up for it. */
   publicSubscribable?: boolean;
   archived?: boolean;
+  /** Sender-identity overrides. Each field independently overrides the
+   *  org-wide default in Settings; an unset field inherits. */
+  fromName?: string;
+  fromLocalPart?: string;
+  replyTo?: string;
   createdAt: string;
   createdBy?: string;
 }
 
-export type CampaignStatus = 'draft' | 'scheduled' | 'queued' | 'sending' | 'sent' | 'failed';
+export type CampaignStatus =
+  | 'draft'
+  | 'scheduled'
+  | 'queued'
+  | 'sending'
+  | 'sent'
+  | 'failed'
+  /** Terminal status for dry-run campaigns. Audience was materialized and
+   *  recipient rows were written, but worker-send was never invoked, so
+   *  no email left SES. Excluded from engagement aggregates. */
+  | 'simulated';
 
 export interface Campaign {
   id: string;
@@ -72,6 +87,20 @@ export interface Campaign {
   createdBy?: string;
   sentAt?: string;
   scheduleAt?: string;
+  /** True when the operator has archived this campaign from History.
+   *  Archived campaigns are excluded from the default tabs and from the
+   *  engagement aggregates; they appear only under the Archived tab. */
+  archived?: boolean;
+  archivedAt?: string;
+  /** True when this campaign was sent as a dry-run. Visible only on the
+   *  Simulated tab; excluded from engagement aggregates. */
+  simulated?: boolean;
+  /** Snapshot of the From header used for this send. Resolved at the
+   *  draft → queueing transition and frozen on the META row. */
+  fromEmail?: string;
+  /** Snapshot of the Reply-To address used for this send. Omitted when
+   *  the campaign was sent with no Reply-To override. */
+  replyTo?: string;
   stats?: {
     delivered?: number;
     /** Total Open events from SES (multi-device opens, prefetchers, scanners). */
@@ -194,8 +223,9 @@ export const listContacts = (
 };
 export const getContact = (email: string) =>
   api<Contact>(`/admin/contacts/${encodeURIComponent(email)}`);
-export const upsertContact = (c: Partial<Contact>) =>
-  api<Contact>('/admin/contacts', { method: 'POST', body: JSON.stringify(c) });
+export const upsertContact = (
+  c: Partial<Contact> & { tagStrategy?: TagStrategy },
+) => api<Contact>('/admin/contacts', { method: 'POST', body: JSON.stringify(c) });
 export const patchContact = (email: string, c: Partial<Contact>) =>
   api<Contact>(`/admin/contacts/${encodeURIComponent(email)}`, {
     method: 'PATCH',
@@ -226,7 +256,11 @@ export const deleteAllContacts = (operationId?: string) =>
 
 // ── Imports ─────────────────────────────────────────────────────────────────
 
-export const createImport = (input: { filename?: string; assignTags?: string[] } = {}) =>
+export type TagStrategy = 'augment' | 'replace';
+
+export const createImport = (
+  input: { filename?: string; assignTags?: string[]; tagStrategy?: TagStrategy } = {},
+) =>
   api<{ importId: string; uploadUrl: string; key: string; expiresIn: number }>(
     '/admin/imports',
     { method: 'POST', body: JSON.stringify(input) },
@@ -253,9 +287,17 @@ export async function uploadCsv(uploadUrl: string, file: File | Blob | string): 
 
 // ── Campaigns ───────────────────────────────────────────────────────────────
 
-export const listCampaigns = (status?: CampaignStatus) => {
-  const qs = status ? `?status=${status}` : '';
-  return api<{ items: Campaign[] }>(`/admin/campaigns${qs}`);
+export const listCampaigns = (
+  status?: CampaignStatus,
+  opts: { archived?: boolean } = {},
+) => {
+  const qs = new URLSearchParams();
+  if (status) qs.set('status', status);
+  // Default behavior: only non-archived rows. Pass `true` explicitly to
+  // load the Archived tab.
+  if (opts.archived) qs.set('archived', 'true');
+  const q = qs.toString();
+  return api<{ items: Campaign[] }>(`/admin/campaigns${q ? `?${q}` : ''}`);
 };
 export const getCampaign = (id: string) => api<Campaign>(`/admin/campaigns/${id}`);
 export const createCampaign = (c: Partial<Campaign>) =>
@@ -271,6 +313,9 @@ export const sendCampaign = (
     testOnly?: boolean;
     /** ISO-8601 UTC timestamp; if present, schedule the send instead of dispatching now. */
     scheduleAt?: string;
+    /** Dry-run. Writes RCPT rows and lands the campaign in `simulated`
+     *  status without invoking SES. Incompatible with `scheduleAt`. */
+    simulate?: boolean;
   },
 ) => api<{ id: string; status: string; enqueued: number; scheduleAt?: string }>(
   `/admin/campaigns/${id}/send`,
@@ -282,6 +327,17 @@ export const cancelScheduledCampaign = (id: string) =>
     `/admin/campaigns/${id}/cancel`,
     { method: 'POST' },
   );
+
+/** Archive a past send so it stops contributing to the engagement
+ *  aggregates and disappears from the default History tabs. Restricted
+ *  server-side to queued / sent / failed campaigns. */
+export const archiveCampaign = (id: string) =>
+  api<Campaign>(`/admin/campaigns/${id}/archive`, { method: 'POST' });
+
+/** Reverse of `archiveCampaign`. Allowed on any campaign so a mistaken
+ *  archive is always recoverable. */
+export const unarchiveCampaign = (id: string) =>
+  api<Campaign>(`/admin/campaigns/${id}/unarchive`, { method: 'POST' });
 
 export interface CampaignRecipient {
   email: string;
@@ -375,6 +431,10 @@ export const previewAudience = (input: {
   tags?: string[];
   excludeTags?: string[];
   tagMode?: 'all' | 'any';
+  /** Default false. Setting true asks the server to also compute the
+   *  per-tag breakdown (`topTags`) — slow on large matched sets. Send
+   *  page does the fast call first then layers in topTags. */
+  topTags?: boolean;
 }) =>
   api<AudiencePreview>('/admin/audience/preview', {
     method: 'POST',
@@ -393,6 +453,19 @@ export interface OrgSettings {
   footerHtml: string;
   senderName?: string;
   senderAddress?: string;
+  /** Org-wide From display name. Combined with `fromLocalPart` + the
+   *  read-only `sendingDomain` to form the outbound `From:` header. */
+  fromName?: string;
+  /** Org-wide From local-part. Lowercase letters, digits, `._-`, ≤ 64 chars. */
+  fromLocalPart?: string;
+  /** Org-wide Reply-To address (any domain). Empty/omitted → reply
+   *  defaults to From. */
+  replyTo?: string;
+  /** Read-only: the verified SES domain mail is sent from. Returned by
+   *  the API but never persisted (it's a deploy-time value). Used by the
+   *  UI to render the static `@<domain>` suffix next to the local-part
+   *  input. */
+  sendingDomain?: string;
   updatedAt?: string;
   updatedBy?: string;
 }

@@ -22,9 +22,14 @@ function SettingsPage() {
   const [footerHtml, setFooterHtml] = useState('');
   const [senderName, setSenderName] = useState('');
   const [senderAddress, setSenderAddress] = useState('');
+  const [fromName, setFromName] = useState('');
+  const [fromLocalPart, setFromLocalPart] = useState('');
+  const [replyTo, setReplyTo] = useState('');
   const [showPreview, setShowPreview] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const seededRef = useRef(false);
+
+  const sendingDomain = data?.sendingDomain ?? '';
 
   const editor = useEditor({
     extensions: [StarterKit, Link.configure({ openOnClick: false, autolink: true })],
@@ -39,6 +44,9 @@ function SettingsPage() {
     setFooterHtml(data.footerHtml ?? '');
     setSenderName(data.senderName ?? '');
     setSenderAddress(data.senderAddress ?? '');
+    setFromName(data.fromName ?? '');
+    setFromLocalPart(data.fromLocalPart ?? '');
+    setReplyTo(data.replyTo ?? '');
     editor.commands.setContent(data.footerHtml || '<p></p>', { emitUpdate: false });
   }, [data, editor]);
 
@@ -60,6 +68,9 @@ function SettingsPage() {
       footerHtml: footerHtml === '<p></p>' ? '' : footerHtml,
       senderName: senderName.trim() || undefined,
       senderAddress: senderAddress.trim() || undefined,
+      fromName: fromName.trim() || undefined,
+      fromLocalPart: fromLocalPart.trim().toLowerCase() || undefined,
+      replyTo: replyTo.trim().toLowerCase() || undefined,
     });
   }
 
@@ -67,10 +78,63 @@ function SettingsPage() {
     !!data &&
     ((data.footerHtml ?? '') !== (footerHtml === '<p></p>' ? '' : footerHtml) ||
       (data.senderName ?? '') !== senderName ||
-      (data.senderAddress ?? '') !== senderAddress);
+      (data.senderAddress ?? '') !== senderAddress ||
+      (data.fromName ?? '') !== fromName ||
+      (data.fromLocalPart ?? '') !== fromLocalPart ||
+      (data.replyTo ?? '') !== replyTo);
 
   return (
     <div className="stack" style={{ gap: 20 }}>
+      {/* Page-level header. The Save button governs *both* the Sender
+          identity card and the Email footer card below — they're sections
+          of one settings record. Visually anchoring Save at the page
+          level (rather than inside one of the cards) makes the shared
+          scope obvious. */}
+      <div
+        className="row items-center justify-between"
+        style={{ gap: 16, flexWrap: 'wrap' }}
+      >
+        <div>
+          <div className="eyebrow">Workspace</div>
+          <h2 className="serif mt-sm" style={{ fontSize: 20 }}>Email settings</h2>
+          <p className="muted" style={{ fontSize: 13, marginTop: 4 }}>
+            Sender identity and footer that apply to every outbound newsletter.
+          </p>
+        </div>
+        <div className="row items-center gap-sm">
+          <button
+            className="btn btn-primary btn-sm"
+            onClick={onSave}
+            disabled={!dirty || saveMut.isPending}
+            type="button"
+          >
+            {saveMut.isPending ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <p className="muted" style={{ color: 'var(--danger, #b91c1c)', fontSize: 13 }}>
+          Failed to load settings: {error instanceof Error ? error.message : String(error)}
+        </p>
+      )}
+      {saveError && (
+        <p className="muted" style={{ color: 'var(--danger, #b91c1c)', fontSize: 13 }}>
+          {saveError}
+        </p>
+      )}
+
+      <SenderIdentityCard
+        fromName={fromName}
+        setFromName={setFromName}
+        fromLocalPart={fromLocalPart}
+        setFromLocalPart={setFromLocalPart}
+        replyTo={replyTo}
+        setReplyTo={setReplyTo}
+        sendingDomain={sendingDomain}
+        loading={isLoading}
+      />
+
       <div className="card">
         <div className="card-header">
           <div>
@@ -82,37 +146,10 @@ function SettingsPage() {
               footer body.
             </p>
           </div>
-          <div className="row items-center gap-sm">
-            <button
-              className="btn btn-ghost btn-sm"
-              onClick={() => setShowPreview((v) => !v)}
-              type="button"
-            >
-              {showPreview ? 'Hide preview' : 'Preview email'}
-            </button>
-            <button
-              className="btn btn-primary btn-sm"
-              onClick={onSave}
-              disabled={!dirty || saveMut.isPending}
-              type="button"
-            >
-              {saveMut.isPending ? 'Saving…' : 'Save'}
-            </button>
-          </div>
         </div>
 
         <div className="card-body stack" style={{ gap: 16 }}>
           {isLoading && <p className="muted">Loading…</p>}
-          {error && (
-            <p className="muted" style={{ color: 'var(--danger, #b91c1c)' }}>
-              Failed to load settings: {error instanceof Error ? error.message : String(error)}
-            </p>
-          )}
-          {saveError && (
-            <p className="muted" style={{ color: 'var(--danger, #b91c1c)' }}>
-              {saveError}
-            </p>
-          )}
 
           <div className="stack" style={{ gap: 6 }}>
             <label className="eyebrow">Sender name</label>
@@ -161,6 +198,15 @@ function SettingsPage() {
               Brand text, social links, etc. Leave empty if you only need the address +
               unsubscribe.
             </p>
+            <div style={{ marginTop: 4 }}>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => setShowPreview((v) => !v)}
+                type="button"
+              >
+                {showPreview ? 'Hide preview' : 'Preview email'}
+              </button>
+            </div>
           </div>
 
           {showPreview && (
@@ -181,6 +227,134 @@ function SettingsPage() {
       </div>
 
       <SubscribeLinksCard />
+    </div>
+  );
+}
+
+/**
+ * Org-wide sender-identity card. Persists via the same Settings PUT as the
+ * footer below — the page-level dirty flag and `onSave` already cover all
+ * fields, so we don't render a separate save button here.
+ *
+ * The local-part field has an inline `@<sendingDomain>` suffix rendered as
+ * static text so users understand the domain is fixed by the SES
+ * verification, not editable.
+ */
+function SenderIdentityCard({
+  fromName,
+  setFromName,
+  fromLocalPart,
+  setFromLocalPart,
+  replyTo,
+  setReplyTo,
+  sendingDomain,
+  loading,
+}: {
+  fromName: string;
+  setFromName: (s: string) => void;
+  fromLocalPart: string;
+  setFromLocalPart: (s: string) => void;
+  replyTo: string;
+  setReplyTo: (s: string) => void;
+  sendingDomain: string;
+  loading: boolean;
+}) {
+  const effectiveName = fromName.trim() || 'Ants Dispatch';
+  const effectiveLocal = fromLocalPart.trim().toLowerCase() || 'dispatch';
+  const previewFrom = sendingDomain
+    ? `${effectiveName} <${effectiveLocal}@${sendingDomain}>`
+    : `${effectiveName} <${effectiveLocal}@…>`;
+  const previewReply = replyTo.trim().toLowerCase() || 'Defaults to From';
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <div>
+          <div className="eyebrow">Workspace</div>
+          <h3 className="serif mt-sm">Sender identity</h3>
+          <p className="muted" style={{ marginTop: 4, fontSize: 13 }}>
+            Controls the <code>From:</code> and <code>Reply-To:</code> headers on
+            every outbound newsletter. Individual newsletter types can override
+            any of these on the type's detail page.
+          </p>
+        </div>
+      </div>
+      <div className="card-body stack" style={{ gap: 16 }}>
+        {loading && <p className="muted">Loading…</p>}
+
+        <div className="stack" style={{ gap: 6 }}>
+          <label className="eyebrow">From display name</label>
+          <input
+            type="text"
+            value={fromName}
+            onChange={(e) => setFromName(e.target.value)}
+            placeholder="e.g. Scienthouse Newsletter"
+            maxLength={120}
+            className="input"
+          />
+          <p className="muted" style={{ fontSize: 12 }}>
+            Shown as the sender label in the recipient's inbox. Defaults to
+            "Ants Dispatch" if blank.
+          </p>
+        </div>
+
+        <div className="stack" style={{ gap: 6 }}>
+          <label className="eyebrow">From address</label>
+          <div className="row items-center" style={{ gap: 6 }}>
+            <input
+              type="text"
+              value={fromLocalPart}
+              onChange={(e) =>
+                setFromLocalPart(e.target.value.toLowerCase().replace(/[^a-z0-9._-]/g, ''))
+              }
+              placeholder="news"
+              maxLength={64}
+              className="input mono-sm"
+              style={{ flex: '0 1 220px', fontFamily: 'var(--mono, monospace)' }}
+            />
+            <span className="muted mono-sm" style={{ fontSize: 13 }}>
+              @{sendingDomain || '<sendingDomain>'}
+            </span>
+          </div>
+          <p className="muted" style={{ fontSize: 12 }}>
+            The domain is fixed by SES verification. Local-part: lowercase
+            letters, digits, dots, dashes, or underscores. Defaults to{' '}
+            <code>dispatch</code> if blank.
+          </p>
+        </div>
+
+        <div className="stack" style={{ gap: 6 }}>
+          <label className="eyebrow">Reply-To (optional)</label>
+          <input
+            type="email"
+            value={replyTo}
+            onChange={(e) => setReplyTo(e.target.value)}
+            placeholder="hello@brand.com"
+            maxLength={254}
+            className="input"
+          />
+          <p className="muted" style={{ fontSize: 12 }}>
+            Where replies are routed when the recipient hits Reply. Can be on
+            any domain — no SES verification required. Leave blank to have
+            replies go to the From address.
+          </p>
+        </div>
+
+        <div
+          style={{
+            padding: '10px 12px',
+            background: 'var(--paper-deep)',
+            borderRadius: 6,
+            border: '1px solid var(--rule-soft, #e5e7eb)',
+          }}
+        >
+          <div className="eyebrow" style={{ marginBottom: 4 }}>Preview headers</div>
+          <div className="mono-sm" style={{ fontSize: 12.5, lineHeight: 1.6 }}>
+            From: {previewFrom}<br />
+            Reply-To: <span className={replyTo.trim() ? '' : 'faint'}>{previewReply}</span>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

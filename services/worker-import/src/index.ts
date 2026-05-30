@@ -76,6 +76,13 @@ async function processS3Record(rec: S3EventRecord): Promise<void> {
   const assignTags: string[] =
     (meta.Item?.assignTags as string[] | undefined)
     ?? (meta.Item?.assignTag ? [meta.Item.assignTag as string] : []);
+  // 'augment' (default) merges assignTags into the contact's existing
+  // tag set — never loses tags. 'replace' overwrites the existing set
+  // with assignTags exactly. Falling back to 'augment' keeps the
+  // previous behavior intact for imports created before the field
+  // existed (or by a client that doesn't send it).
+  const tagStrategy: TagStrategy =
+    meta.Item?.tagStrategy === 'replace' ? 'replace' : 'augment';
 
   await setImportStatus(importId, 'processing');
 
@@ -127,7 +134,7 @@ async function processS3Record(rec: S3EventRecord): Promise<void> {
     const uniqueEmails = [...byEmail.keys()];
     for (let i = 0; i < uniqueEmails.length; i += IMPORT_CHUNK_SIZE) {
       const chunk = uniqueEmails.slice(i, i + IMPORT_CHUNK_SIZE);
-      await processChunk(chunk, byEmail, assignTags, counts, importId, recordFailure);
+      await processChunk(chunk, byEmail, assignTags, tagStrategy, counts, importId, recordFailure);
     }
 
     await setImportStatus(importId, 'done', { counts, failures, failuresTruncated });
@@ -158,6 +165,12 @@ interface ImportCounts {
   suppressed: number;
   invalid: number;
 }
+
+/** How `assignTags` from the upload interact with a contact's existing
+ *  tags. `'augment'` adds without removing; `'replace'` makes assignTags
+ *  the contact's full tag set. New contacts (no existing profile) get
+ *  exactly assignTags either way. */
+type TagStrategy = 'augment' | 'replace';
 
 interface ImportFailure {
   /** For `invalid`: the raw email-cell value from the CSV row, truncated.
@@ -190,6 +203,7 @@ async function processChunk(
   emails: string[],
   byEmail: Map<string, { row: Record<string, string>; occurrences: number }>,
   assignTags: string[],
+  tagStrategy: TagStrategy,
   counts: ImportCounts,
   importId: string,
   recordFailure: (email: string, reason: ImportFailure['reason']) => void,
@@ -246,7 +260,7 @@ async function processChunk(
       continue;
     }
 
-    const requests = buildContactWrites(email, row, existing, assignTags);
+    const requests = buildContactWrites(email, row, existing, assignTags, tagStrategy);
     for (const r of requests) writes.push(r);
     if (existing) counts.updated += occurrences;
     else counts.inserted += occurrences;
@@ -272,10 +286,22 @@ function buildContactWrites(
   row: Record<string, string>,
   existing: Record<string, unknown> | undefined,
   assignTags: string[],
+  tagStrategy: TagStrategy,
 ): { PutRequest?: unknown; DeleteRequest?: unknown }[] {
   const prevTags = (existing?.tags as string[] | undefined) ?? [];
-  const newTags = assignTags.filter((t) => !prevTags.includes(t));
-  const tags = newTags.length > 0 ? [...prevTags, ...newTags] : prevTags;
+  // 'replace' makes assignTags the contact's full tag set: anything in
+  // prevTags but not in assignTags is removed (PROFILE.tags is
+  // overwritten AND the corresponding tag-association rows are
+  // explicitly deleted so the tag-based audience queries stay in sync).
+  // 'augment' preserves prevTags and adds only the genuinely new tags
+  // — never removes anything.
+  const tags = tagStrategy === 'replace'
+    ? [...assignTags]
+    : [...prevTags, ...assignTags.filter((t) => !prevTags.includes(t))];
+  const tagsToAdd = assignTags.filter((t) => !prevTags.includes(t));
+  const tagsToRemove = tagStrategy === 'replace'
+    ? prevTags.filter((t) => !assignTags.includes(t))
+    : [];
   const now = new Date().toISOString();
   const status =
     existing?.status === 'unsubscribed' || existing?.status === 'bounced'
@@ -308,7 +334,10 @@ function buildContactWrites(
 
   return [
     { PutRequest: { Item: profile } },
-    ...newTags.map((t) => ({
+    ...tagsToRemove.map((t) => ({
+      DeleteRequest: { Key: { PK: `CONTACT#${email}`, SK: `TAG#${t}` } },
+    })),
+    ...tagsToAdd.map((t) => ({
       PutRequest: {
         Item: {
           PK: `CONTACT#${email}`,

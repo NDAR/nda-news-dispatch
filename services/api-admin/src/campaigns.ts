@@ -19,6 +19,9 @@ import {
   batchGetAll,
   batchWriteAll,
   materializeAudienceEmails,
+  resolveSender,
+  type OrgSettings,
+  type SenderOverrides,
 } from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
@@ -29,6 +32,7 @@ const scheduler = new SchedulerClient({});
 
 const TABLE = mustEnv('TABLE_NAME');
 const ENQUEUE_QUEUE_URL = mustEnv('ENQUEUE_QUEUE_URL');
+const SENDING_DOMAIN = mustEnv('SENDING_DOMAIN');
 // Scheduling-related env vars are optional in dev so the handler still works
 // before the scheduler infra has been deployed; we error on actual schedule
 // creation if any are missing.
@@ -63,6 +67,10 @@ export const handler: APIGatewayProxyHandler = async (event) => {
         return ok(await sendCampaign(path(event, 'id'), parseBody(event), claimsOf(event)));
       case 'POST /admin/campaigns/{id}/cancel':
         return ok(await cancelScheduledCampaign(path(event, 'id')));
+      case 'POST /admin/campaigns/{id}/archive':
+        return ok(await setCampaignArchived(path(event, 'id'), true));
+      case 'POST /admin/campaigns/{id}/unarchive':
+        return ok(await setCampaignArchived(path(event, 'id'), false));
       default:
         return err(404, 'not-found', `No route for ${route}`);
     }
@@ -90,6 +98,12 @@ interface SendInput {
   testOnly?: boolean;
   /** ISO-8601 UTC. If present, schedule the send instead of dispatching now. */
   scheduleAt?: string;
+  /** Dry-run. Walks the real pipeline (audience materialization, RCPT row
+   *  writes) but skips the per-recipient send-queue fan-out, so SES is
+   *  never invoked. The resulting campaign lands in a terminal `simulated`
+   *  status and is excluded from engagement aggregates. Incompatible with
+   *  `scheduleAt`. */
+  simulate?: boolean;
 }
 
 interface CampaignRecord {
@@ -102,7 +116,7 @@ interface CampaignRecord {
   typeId?: string;
   subject: string;
   html: string;
-  status: 'draft' | 'scheduled' | 'queueing' | 'queued' | 'sending' | 'sent' | 'failed';
+  status: 'draft' | 'scheduled' | 'queueing' | 'queued' | 'sending' | 'sent' | 'failed' | 'simulated';
   recipients: number;
   tags: string[];
   excludeTags: string[];
@@ -111,6 +125,26 @@ interface CampaignRecord {
   createdBy?: string;
   sentAt?: string;
   scheduleAt?: string;
+  /** True when the operator has archived this campaign from the History
+   *  page. Archived rows are hidden from the default tabs and excluded
+   *  from the engagement aggregates (open/click/unsub/bounce rates).
+   *  Status stays unchanged so analytics tooling that joins on status
+   *  doesn't have to special-case "archived" — archive is orthogonal. */
+  archived?: boolean;
+  archivedAt?: string;
+  /** Dry-run campaign. The audience was materialized and RCPT rows were
+   *  written, but worker-send was never invoked — no email left SES.
+   *  Excluded from engagement aggregates the same way `archived` is. */
+  simulated?: boolean;
+  /** Snapshot of the From header used for this send. Resolved at send
+   *  time from Settings + the campaign's NewsletterType and frozen onto
+   *  META so editing Settings mid-flight can't retroactively rewrite the
+   *  outbound headers. */
+  fromEmail?: string;
+  /** Snapshot of the Reply-To address used for this send. Empty/omitted
+   *  when no override was set; worker-send omits the Reply-To header
+   *  entirely in that case. */
+  replyTo?: string;
 }
 
 async function listCampaigns(
@@ -118,12 +152,24 @@ async function listCampaigns(
 ): Promise<{ items: (CampaignRecord & { stats?: Record<string, number> })[] }> {
   const status = event.queryStringParameters?.status;
   const pk = status ? `STATUS#${status}` : 'STATUS#draft';
+
+  // `archived=true` returns only archived rows; anything else (including
+  // omitted) returns only non-archived rows. The History page passes
+  // `false` for normal tabs and `true` only on the dedicated Archived tab,
+  // which matches the rule "archived sends don't appear in All."
+  const wantArchived = event.queryStringParameters?.archived === 'true';
+  const filterExpression = wantArchived
+    ? 'archived = :true'
+    : '(attribute_not_exists(archived) OR archived = :false)';
+  const filterValues = wantArchived ? { ':true': true } : { ':false': false };
+
   const res = await ddb.send(
     new QueryCommand({
       TableName: TABLE,
       IndexName: 'GSI1',
       KeyConditionExpression: 'GSI1PK = :pk',
-      ExpressionAttributeValues: { ':pk': pk },
+      FilterExpression: filterExpression,
+      ExpressionAttributeValues: { ':pk': pk, ...filterValues },
       ScanIndexForward: false,
       Limit: 100,
     }),
@@ -305,6 +351,57 @@ async function createCampaign(input: CampaignInput, claims: Claims): Promise<Cam
   return record;
 }
 
+/**
+ * Toggles the archived flag on a campaign. Archive is restricted to
+ * "past send" states (queued = successfully-sent, sent, failed). Drafts
+ * and scheduled campaigns can't be archived — there's a Delete action
+ * for drafts and a Cancel action for scheduled, both of which are
+ * semantically distinct from archive.
+ *
+ * Unarchive (archived=false) is allowed regardless of current status:
+ * if a campaign somehow ended up archived in a state where archive
+ * shouldn't have been possible, the operator should still be able to
+ * undo it.
+ */
+async function setCampaignArchived(id: string, archived: boolean): Promise<CampaignRecord> {
+  const meta = await ddb.send(
+    new GetCommand({ TableName: TABLE, Key: { PK: `CAMPAIGN#${id}`, SK: 'META' } }),
+  );
+  if (!meta.Item) throw new HttpError(404, 'not-found', `Campaign ${id} not found`);
+  const status = meta.Item.status as CampaignRecord['status'];
+  if (archived && !ARCHIVABLE_STATUSES.has(status)) {
+    throw new HttpError(
+      409,
+      'illegal-state',
+      `Only past sends can be archived (status was "${status}").`,
+    );
+  }
+  const now = new Date().toISOString();
+  const update = archived
+    ? {
+        UpdateExpression: 'SET archived = :true, archivedAt = :now',
+        ExpressionAttributeValues: { ':true': true, ':now': now },
+      }
+    : {
+        UpdateExpression: 'REMOVE archived, archivedAt',
+      };
+  const res = await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { PK: `CAMPAIGN#${id}`, SK: 'META' },
+      ...update,
+      ReturnValues: 'ALL_NEW',
+    }),
+  );
+  return stripKeys(res.Attributes ?? {}) as unknown as CampaignRecord;
+}
+
+const ARCHIVABLE_STATUSES: ReadonlySet<CampaignRecord['status']> = new Set([
+  'queued',
+  'sent',
+  'failed',
+]);
+
 async function deleteCampaign(id: string): Promise<{ id: string; deleted: true }> {
   const existing = await getCampaign(id).catch(() => null);
   if (!existing) throw new HttpError(404, 'not-found', `Campaign ${id} not found`);
@@ -330,6 +427,7 @@ async function sendCampaign(
   const tags = validTags(input.tags);
   const excludeTags = validTags(input.excludeTags);
   const testOnly = !!input.testOnly;
+  const simulate = !!input.simulate;
   const actor = claims.email ?? claims.sub ?? 'unknown';
 
   const typeId = typeof meta.Item.typeId === 'string' ? meta.Item.typeId : undefined;
@@ -338,18 +436,56 @@ async function sendCampaign(
     return { id, status: 'draft', enqueued: 0 };
   }
 
+  // Dry-run path. Same SQS fan-out into worker-enqueue as a real send; the
+  // worker reads `simulated` off the META row and skips the per-recipient
+  // SEND queue push. Disallow combining with scheduleAt — a scheduled
+  // dry-run has no clear meaning (the operator can just run the simulation
+  // now to verify targeting).
+  if (simulate) {
+    if (input.scheduleAt) {
+      throw new HttpError(400, 'illegal-input', 'Cannot schedule a simulated send');
+    }
+    const now = new Date().toISOString();
+    const sender = await resolveSenderForCampaign(typeId);
+    await claimStatusFromDraft(id, 'queueing', {
+      tags,
+      excludeTags,
+      tagMode,
+      actor,
+      simulated: true,
+      fromEmail: sender.fromEmail,
+      replyTo: sender.replyTo,
+    });
+    try {
+      await sqs.send(
+        new SendMessageCommand({
+          QueueUrl: ENQUEUE_QUEUE_URL,
+          MessageBody: JSON.stringify({ campaignId: id }),
+        }),
+      );
+      return { id, status: 'queueing', enqueued: 0 };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await markStatus(id, 'failed', { sentAt: now, error: msg });
+      throw e;
+    }
+  }
+
   if (input.scheduleAt) {
     const scheduleAt = validateScheduleAt(input.scheduleAt);
     if (!SCHEDULE_GROUP || !SCHEDULE_EXEC_ROLE_ARN || !DISPATCH_FN_ARN) {
       throw new HttpError(503, 'scheduler-unconfigured', 'Scheduled sends are not enabled in this environment');
     }
 
+    const sender = await resolveSenderForCampaign(typeId);
     await claimStatusFromDraft(id, 'scheduled', {
       tags,
       excludeTags,
       tagMode,
       actor,
       scheduleAt,
+      fromEmail: sender.fromEmail,
+      replyTo: sender.replyTo,
     });
 
     try {
@@ -381,7 +517,15 @@ async function sendCampaign(
   // promptly even for 50K-recipient campaigns. The worker materializes the
   // audience, writes RCPT rows, and pushes per-recipient messages into the
   // send queue. Status flow: draft → queueing → queued → (sending) → ...
-  await claimStatusFromDraft(id, 'queueing', { tags, excludeTags, tagMode, actor });
+  const sender = await resolveSenderForCampaign(typeId);
+  await claimStatusFromDraft(id, 'queueing', {
+    tags,
+    excludeTags,
+    tagMode,
+    actor,
+    fromEmail: sender.fromEmail,
+    replyTo: sender.replyTo,
+  });
 
   try {
     await sqs.send(
@@ -474,28 +618,66 @@ async function claimStatusFromDraft(
     tagMode: 'all' | 'any';
     actor: string;
     scheduleAt?: string;
+    /** When true, persist `simulated = true` atomically with the status
+     *  transition so worker-enqueue can read it from the META row and
+     *  branch to the no-SES path. */
+    simulated?: boolean;
+    /** Snapshot of the resolved From / Reply-To at send time. Written
+     *  atomically with the draft → next-status transition so worker-send
+     *  reads stable values even if Settings or the Type are edited
+     *  mid-flight. */
+    fromEmail?: string;
+    replyTo?: string;
   },
 ): Promise<void> {
+  // Build SET clauses dynamically so a `simulated` write can be added without
+  // breaking the existing schedule/queueing shape.
+  const setClauses = ['#s = :s', 'tags = :t', 'excludeTags = :x', 'tagMode = :m', 'GSI1PK = :gpk', 'sentBy = :sb'];
+  const removeClauses: string[] = [];
+  const values: Record<string, unknown> = {
+    ':s': nextStatus,
+    ':draft': 'draft',
+    ':t': opts.tags,
+    ':x': opts.excludeTags,
+    ':m': opts.tagMode,
+    ':gpk': `STATUS#${nextStatus}`,
+    ':sb': opts.actor,
+  };
+  if (opts.scheduleAt) {
+    setClauses.push('scheduleAt = :sched', 'scheduledBy = :sb');
+    values[':sched'] = opts.scheduleAt;
+  } else {
+    removeClauses.push('scheduleAt', 'scheduledBy');
+  }
+  if (opts.simulated) {
+    setClauses.push('simulated = :sim');
+    values[':sim'] = true;
+  }
+  if (opts.fromEmail) {
+    setClauses.push('fromEmail = :fe');
+    values[':fe'] = opts.fromEmail;
+  }
+  if (opts.replyTo) {
+    setClauses.push('replyTo = :rt');
+    values[':rt'] = opts.replyTo;
+  } else {
+    // No explicit override: don't write the attr, but make sure a stale
+    // value from a previous draft → queueing → draft round-trip isn't left
+    // behind on the row.
+    removeClauses.push('replyTo');
+  }
+  const updateExpr =
+    'SET ' + setClauses.join(', ') +
+    (removeClauses.length > 0 ? ' REMOVE ' + removeClauses.join(', ') : '');
   try {
     await ddb.send(
       new UpdateCommand({
         TableName: TABLE,
         Key: { PK: `CAMPAIGN#${id}`, SK: 'META' },
-        UpdateExpression:
-          'SET #s = :s, tags = :t, excludeTags = :x, tagMode = :m, GSI1PK = :gpk, sentBy = :sb' +
-          (opts.scheduleAt ? ', scheduleAt = :sched, scheduledBy = :sb' : ' REMOVE scheduleAt, scheduledBy'),
+        UpdateExpression: updateExpr,
         ConditionExpression: '#s = :draft',
         ExpressionAttributeNames: { '#s': 'status' },
-        ExpressionAttributeValues: {
-          ':s': nextStatus,
-          ':draft': 'draft',
-          ':t': opts.tags,
-          ':x': opts.excludeTags,
-          ':m': opts.tagMode,
-          ':gpk': `STATUS#${nextStatus}`,
-          ':sb': opts.actor,
-          ':sched': opts.scheduleAt,
-        },
+        ExpressionAttributeValues: values,
       }),
     );
   } catch (e) {
@@ -504,6 +686,41 @@ async function claimStatusFromDraft(
     }
     throw e;
   }
+}
+
+/**
+ * Loads org Settings + (optionally) the campaign's NewsletterType and
+ * runs the shared `resolveSender` to compute the effective From / Reply-To
+ * at this moment. Caller passes the result through `claimStatusFromDraft`
+ * so the values are snapshotted onto the campaign META row atomically
+ * with the status transition.
+ */
+async function resolveSenderForCampaign(typeId: string | undefined): Promise<{
+  fromEmail: string;
+  replyTo?: string;
+}> {
+  const [settingsRes, typeRes] = await Promise.all([
+    ddb.send(new GetCommand({ TableName: TABLE, Key: { PK: 'ORG#default', SK: 'SETTINGS' } })),
+    typeId
+      ? ddb.send(new GetCommand({ TableName: TABLE, Key: { PK: `TYPE#${typeId}`, SK: 'LATEST' } }))
+      : Promise.resolve({ Item: undefined as Record<string, unknown> | undefined }),
+  ]);
+  const orgDefaults: OrgSettings = {
+    footerHtml: typeof settingsRes.Item?.footerHtml === 'string' ? settingsRes.Item.footerHtml : '',
+    fromName: typeof settingsRes.Item?.fromName === 'string' ? settingsRes.Item.fromName : undefined,
+    fromLocalPart:
+      typeof settingsRes.Item?.fromLocalPart === 'string' ? settingsRes.Item.fromLocalPart : undefined,
+    replyTo: typeof settingsRes.Item?.replyTo === 'string' ? settingsRes.Item.replyTo : undefined,
+  };
+  const typeOverrides: SenderOverrides | undefined = typeRes.Item
+    ? {
+        fromName: typeof typeRes.Item.fromName === 'string' ? typeRes.Item.fromName : undefined,
+        fromLocalPart:
+          typeof typeRes.Item.fromLocalPart === 'string' ? typeRes.Item.fromLocalPart : undefined,
+        replyTo: typeof typeRes.Item.replyTo === 'string' ? typeRes.Item.replyTo : undefined,
+      }
+    : undefined;
+  return resolveSender(orgDefaults, typeOverrides, SENDING_DOMAIN);
 }
 
 async function rollbackScheduledDraft(id: string): Promise<void> {

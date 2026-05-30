@@ -12,6 +12,11 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
+import {
+  resolveSender,
+  type OrgSettings,
+  type SenderOverrides,
+} from '../../../packages/shared/src';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -24,6 +29,7 @@ const ARCHIVE_BUCKET = mustEnv('ARCHIVE_BUCKET');
 // Optional: only required for the test-send route. Older deploys may not
 // have it wired yet — error at the call site rather than at cold start.
 const SEND_QUEUE_URL = process.env.SEND_QUEUE_URL;
+const SENDING_DOMAIN = process.env.SENDING_DOMAIN ?? '';
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -174,6 +180,13 @@ async function testSendTemplate(
   if (!tpl.html) throw new HttpError(400, 'invalid-template', 'Template has no content');
 
   const subject = tpl.subject.startsWith('[TEST] ') ? tpl.subject : `[TEST] ${tpl.subject}`;
+  // Resolve the same From/Reply-To a real campaign would use for this
+  // template's newsletter type. Test sends have no campaign META row to
+  // snapshot onto, so we attach the resolved values to the SQS message
+  // itself — worker-send reads `job.from` / `job.replyTo` directly for
+  // test sends, falling back to the env FROM_ADDRESS only when neither
+  // META nor the job carries an override.
+  const sender = await resolveSenderForTemplate(tpl.typeId);
   await sqs.send(
     new SendMessageCommand({
       QueueUrl: SEND_QUEUE_URL,
@@ -183,11 +196,47 @@ async function testSendTemplate(
         subject,
         html: tpl.html,
         test: true,
+        from: sender.fromEmail,
+        replyTo: sender.replyTo,
       }),
     }),
   );
   console.log(JSON.stringify({ level: 'info', msg: 'test-send-enqueued', id, to }));
   return { id, to, enqueued: 1 };
+}
+
+/** Same shape as `resolveSenderForCampaign` in campaigns.ts but lookup-only
+ *  on the template's typeId. Test sends are never persisted as campaigns
+ *  so there's nowhere to snapshot the result. */
+async function resolveSenderForTemplate(typeId: string | undefined): Promise<{
+  fromEmail: string;
+  replyTo?: string;
+}> {
+  if (!SENDING_DOMAIN) {
+    throw new HttpError(503, 'sending-domain-unconfigured', 'SENDING_DOMAIN is not set');
+  }
+  const [settingsRes, typeRes] = await Promise.all([
+    ddb.send(new GetCommand({ TableName: TABLE, Key: { PK: 'ORG#default', SK: 'SETTINGS' } })),
+    typeId
+      ? ddb.send(new GetCommand({ TableName: TABLE, Key: { PK: `TYPE#${typeId}`, SK: 'LATEST' } }))
+      : Promise.resolve({ Item: undefined as Record<string, unknown> | undefined }),
+  ]);
+  const orgDefaults: OrgSettings = {
+    footerHtml: typeof settingsRes.Item?.footerHtml === 'string' ? settingsRes.Item.footerHtml : '',
+    fromName: typeof settingsRes.Item?.fromName === 'string' ? settingsRes.Item.fromName : undefined,
+    fromLocalPart:
+      typeof settingsRes.Item?.fromLocalPart === 'string' ? settingsRes.Item.fromLocalPart : undefined,
+    replyTo: typeof settingsRes.Item?.replyTo === 'string' ? settingsRes.Item.replyTo : undefined,
+  };
+  const typeOverrides: SenderOverrides | undefined = typeRes.Item
+    ? {
+        fromName: typeof typeRes.Item.fromName === 'string' ? typeRes.Item.fromName : undefined,
+        fromLocalPart:
+          typeof typeRes.Item.fromLocalPart === 'string' ? typeRes.Item.fromLocalPart : undefined,
+        replyTo: typeof typeRes.Item.replyTo === 'string' ? typeRes.Item.replyTo : undefined,
+      }
+    : undefined;
+  return resolveSender(orgDefaults, typeOverrides, SENDING_DOMAIN);
 }
 
 async function softDeleteTemplate(id: string): Promise<{ id: string; deleted: true }> {

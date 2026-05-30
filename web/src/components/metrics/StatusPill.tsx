@@ -7,6 +7,7 @@ const LABEL: Record<CampaignStatus, string> = {
   sent: 'Sent',
   draft: 'Draft',
   failed: 'Failed',
+  simulated: 'Dry-run',
 };
 
 // Map storage status → CSS class. queued/sent/sending all read as "Sent" to
@@ -18,6 +19,8 @@ const PILL_CLASS: Record<CampaignStatus, string> = {
   sent: 'sent',
   draft: 'draft',
   failed: 'failed',
+  // Reuse the neutral draft styling — clearly not-a-real-send.
+  simulated: 'draft',
 };
 
 export function StatusPill({ status }: { status: CampaignStatus }) {

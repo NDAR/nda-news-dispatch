@@ -250,6 +250,18 @@ h3 { font-size: 18px; line-height: 1.25; }
   line-height: 1;
 }
 .btn:hover { background: var(--paper-deep); border-color: var(--ink-faint); }
+.btn:disabled,
+.btn:disabled:hover {
+  opacity: 0.45;
+  cursor: not-allowed;
+  background: var(--paper);
+  border-color: var(--rule);
+  color: var(--ink);
+}
+.btn-primary:disabled,
+.btn-primary:disabled:hover { background: var(--ink); border-color: var(--ink); color: var(--paper); }
+.btn-accent:disabled,
+.btn-accent:disabled:hover { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn-primary {
   background: var(--ink);
   color: var(--paper);
@@ -701,6 +713,17 @@ h3 { font-size: 18px; line-height: 1.25; }
   0% { box-shadow: 0 0 0 0 oklch(0.55 0.10 145 / 0.5); }
   70% { box-shadow: 0 0 0 8px oklch(0.55 0.10 145 / 0); }
   100% { box-shadow: 0 0 0 0 oklch(0.55 0.10 145 / 0); }
+}
+
+/* Skeleton placeholder shimmer. Used while a slow query is in flight
+   to communicate "something's loading here" without shifting the
+   surrounding layout. */
+.skeleton-pulse {
+  animation: skeleton-pulse 1.4s ease-in-out infinite;
+}
+@keyframes skeleton-pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 0.85; }
 }
 
 /* Tooltip-like labels for charts */

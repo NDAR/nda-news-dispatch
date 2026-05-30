@@ -7,11 +7,15 @@ import LinkExt from '@tiptap/extension-link';
 import Image from '@tiptap/extension-image';
 import {
   createType,
+  getSettings,
   getType,
   updateType,
   type NewsletterType,
 } from '../api/endpoints';
 import { TypePill } from '../components/types/TypePill';
+
+const DEFAULT_FROM_NAME = 'Ants Dispatch';
+const DEFAULT_FROM_LOCAL_PART = 'dispatch';
 
 export const Route = createFileRoute('/_app/types/$typeId')({
   component: TypeEditPage,
@@ -38,9 +42,16 @@ function TypeEditPage() {
   const [defaultSubjectPrefix, setDefaultSubjectPrefix] = useState('');
   const [defaultBodyHtml, setDefaultBodyHtml] = useState('');
   const [publicSubscribable, setPublicSubscribable] = useState(false);
+  const [fromName, setFromName] = useState('');
+  const [fromLocalPart, setFromLocalPart] = useState('');
+  const [replyTo, setReplyTo] = useState('');
   const [tagWarning, setTagWarning] = useState<string | null>(null);
   const [editorMode, setEditorMode] = useState<'visual' | 'code'>('visual');
   const seededRef = useRef(false);
+
+  // Org defaults — used to render the "inherits …" hints next to each
+  // override field so the operator knows what blank means.
+  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: getSettings });
 
   const editor = useEditor({
     extensions: [
@@ -65,6 +76,9 @@ function TypeEditPage() {
       setDefaultSubjectPrefix(existing.defaultSubjectPrefix ?? '');
       setDefaultBodyHtml(existing.defaultBodyHtml ?? '');
       setPublicSubscribable(existing.publicSubscribable === true);
+      setFromName(existing.fromName ?? '');
+      setFromLocalPart(existing.fromLocalPart ?? '');
+      setReplyTo(existing.replyTo ?? '');
       editor.commands.setContent(existing.defaultBodyHtml || '<p></p>', { emitUpdate: false });
     }
   }, [editor, existing, isNew]);
@@ -107,6 +121,11 @@ function TypeEditPage() {
       defaultSubjectPrefix: defaultSubjectPrefix.trim() || undefined,
       defaultBodyHtml: cleanedHtml || undefined,
       publicSubscribable,
+      // Blank = inherit from org Settings; backend stores undefined and
+      // resolveSender() picks the org value (or its built-in fallback).
+      fromName: fromName.trim() || undefined,
+      fromLocalPart: fromLocalPart.trim().toLowerCase() || undefined,
+      replyTo: replyTo.trim().toLowerCase() || undefined,
     });
   }
 
@@ -248,6 +267,19 @@ function TypeEditPage() {
         </div>
       </div>
 
+      <SenderIdentityOverrideCard
+        fromName={fromName}
+        setFromName={setFromName}
+        fromLocalPart={fromLocalPart}
+        setFromLocalPart={setFromLocalPart}
+        replyTo={replyTo}
+        setReplyTo={setReplyTo}
+        orgFromName={settings?.fromName}
+        orgFromLocalPart={settings?.fromLocalPart}
+        orgReplyTo={settings?.replyTo}
+        sendingDomain={settings?.sendingDomain ?? ''}
+      />
+
       <div className="card">
         <div className="card-header">
           <div>
@@ -314,6 +346,140 @@ function TypeEditPage() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * Per-type sender-identity overrides. Each of the three fields is
+ * independently optional — leaving a field blank means inherit the org
+ * Settings value. The hint under each input tells the operator what
+ * blank will resolve to: the org default if set, otherwise the
+ * system-wide fallback (`Ants Dispatch` / `dispatch` / no Reply-To).
+ *
+ * The "Resolved" preview at the bottom shows the actual From + Reply-To
+ * headers that a campaign on this type would receive given the current
+ * combination of overrides + org defaults.
+ */
+function SenderIdentityOverrideCard({
+  fromName,
+  setFromName,
+  fromLocalPart,
+  setFromLocalPart,
+  replyTo,
+  setReplyTo,
+  orgFromName,
+  orgFromLocalPart,
+  orgReplyTo,
+  sendingDomain,
+}: {
+  fromName: string;
+  setFromName: (s: string) => void;
+  fromLocalPart: string;
+  setFromLocalPart: (s: string) => void;
+  replyTo: string;
+  setReplyTo: (s: string) => void;
+  orgFromName: string | undefined;
+  orgFromLocalPart: string | undefined;
+  orgReplyTo: string | undefined;
+  sendingDomain: string;
+}) {
+  const effectiveName = fromName.trim() || orgFromName || DEFAULT_FROM_NAME;
+  const effectiveLocal = fromLocalPart.trim().toLowerCase() || orgFromLocalPart || DEFAULT_FROM_LOCAL_PART;
+  const effectiveReply = replyTo.trim().toLowerCase() || orgReplyTo || '';
+  const previewFrom = sendingDomain
+    ? `${effectiveName} <${effectiveLocal}@${sendingDomain}>`
+    : `${effectiveName} <${effectiveLocal}@…>`;
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <div>
+          <div className="eyebrow">Sender identity</div>
+          <h3 className="serif mt-sm">Override (optional)</h3>
+          <p className="muted" style={{ fontSize: 13, marginTop: 4 }}>
+            Sends on this type use these From / Reply-To values instead of
+            the org-wide defaults from <Link to="/settings">Settings</Link>.
+            Leave any field blank to inherit.
+          </p>
+        </div>
+      </div>
+      <div className="card-body stack" style={{ gap: 16 }}>
+        <div className="stack" style={{ gap: 6 }}>
+          <label className="eyebrow">From display name (override)</label>
+          <input
+            type="text"
+            value={fromName}
+            onChange={(e) => setFromName(e.target.value)}
+            placeholder={orgFromName || DEFAULT_FROM_NAME}
+            maxLength={120}
+            className="input"
+          />
+          <p className="muted" style={{ fontSize: 12 }}>
+            Inherits <strong>{orgFromName || DEFAULT_FROM_NAME}</strong> from
+            {orgFromName ? ' Settings' : ' the system default'} when blank.
+          </p>
+        </div>
+
+        <div className="stack" style={{ gap: 6 }}>
+          <label className="eyebrow">From address (override)</label>
+          <div className="row items-center" style={{ gap: 6 }}>
+            <input
+              type="text"
+              value={fromLocalPart}
+              onChange={(e) =>
+                setFromLocalPart(e.target.value.toLowerCase().replace(/[^a-z0-9._-]/g, ''))
+              }
+              placeholder={orgFromLocalPart || DEFAULT_FROM_LOCAL_PART}
+              maxLength={64}
+              className="input mono-sm"
+              style={{ flex: '0 1 220px', fontFamily: 'var(--mono, monospace)' }}
+            />
+            <span className="muted mono-sm" style={{ fontSize: 13 }}>
+              @{sendingDomain || '<sendingDomain>'}
+            </span>
+          </div>
+          <p className="muted" style={{ fontSize: 12 }}>
+            Inherits <strong>{orgFromLocalPart || DEFAULT_FROM_LOCAL_PART}</strong> from
+            {orgFromLocalPart ? ' Settings' : ' the system default'} when blank.
+          </p>
+        </div>
+
+        <div className="stack" style={{ gap: 6 }}>
+          <label className="eyebrow">Reply-To (override)</label>
+          <input
+            type="email"
+            value={replyTo}
+            onChange={(e) => setReplyTo(e.target.value)}
+            placeholder={orgReplyTo || 'Defaults to From'}
+            maxLength={254}
+            className="input"
+          />
+          <p className="muted" style={{ fontSize: 12 }}>
+            {orgReplyTo
+              ? <>Inherits <strong>{orgReplyTo}</strong> from Settings when blank.</>
+              : <>No org default set — blank means replies go to the From address.</>}
+          </p>
+        </div>
+
+        <div
+          style={{
+            padding: '10px 12px',
+            background: 'var(--paper-deep)',
+            borderRadius: 6,
+            border: '1px solid var(--rule-soft, #e5e7eb)',
+          }}
+        >
+          <div className="eyebrow" style={{ marginBottom: 4 }}>Resolved headers for this type</div>
+          <div className="mono-sm" style={{ fontSize: 12.5, lineHeight: 1.6 }}>
+            From: {previewFrom}<br />
+            Reply-To:{' '}
+            <span className={effectiveReply ? '' : 'faint'}>
+              {effectiveReply || 'Defaults to From'}
+            </span>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
