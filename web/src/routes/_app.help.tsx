@@ -20,23 +20,23 @@ const SECTIONS: Section[] = [
     body: () => (
       <>
         <p>
-          Dispatch is a newsletter tool that turns a HTML draft into an email sent to a tagged
-          slice of your contact list. The five core areas live in the left nav:
+          Dispatch turns an HTML newsletter draft into either a real send or a dry-run against a
+          tagged slice of your contact list. The five core work areas live in the left nav:
         </p>
         <ol>
-          <li><strong>Types</strong> — categories like “Quarterly” or “Product update” that group newsletters and seed defaults.</li>
-          <li><strong>Compose</strong> — write the newsletter body, subject, and tags.</li>
-          <li><strong>Subscribers</strong> — manage the contact list and the suppression list.</li>
-          <li><strong>Send</strong> — pick recipients, optionally schedule, and dispatch.</li>
-          <li><strong>History</strong> — past sends and engagement metrics.</li>
+          <li><strong>Types</strong> — categories like “Quarterly” or “Product update” that seed defaults, public signup eligibility, and optional sender overrides.</li>
+          <li><strong>Compose</strong> — write the newsletter body, subject, and internal title.</li>
+          <li><strong>Subscribers</strong> — manage contacts, suppressions, CSV imports, and audience cleanup.</li>
+          <li><strong>Send</strong> — preview recipients, simulate, schedule, or send.</li>
+          <li><strong>History</strong> — sent campaigns, dry-runs, archived campaigns, and engagement metrics.</li>
         </ol>
         <p>
-          Plus <strong>Settings</strong> (footer + sender info, applied to every send) and this
-          Help page.
+          Plus <strong>Settings</strong> (sender identity, footer, and public subscribe links,
+          applied org-wide) and this Help page.
         </p>
         <p className="muted" style={{ fontSize: 13 }}>
           A typical first run: create a Type → Compose a draft → import or add Subscribers →
-          Send → check History.
+          preview the audience on Send → optionally run a dry-run → send → check History.
         </p>
       </>
     ),
@@ -54,6 +54,8 @@ const SECTIONS: Section[] = [
         <ul>
           <li>Filter History and aggregate stats by type.</li>
           <li>Auto-fill subject prefix, audience tags, and the starting HTML body for new newsletters.</li>
+          <li>Opt a type into the public subscribe page.</li>
+          <li>Override the org-wide From name, From address local-part, or Reply-To for this type only.</li>
           <li>Color-code the UI so editors immediately recognize what they’re looking at.</li>
         </ul>
         <h4>Editing a type</h4>
@@ -62,11 +64,14 @@ const SECTIONS: Section[] = [
           <li>Set name, color (hue slider), description.</li>
           <li><strong>Default subject prefix</strong> — e.g. <code>[Quarterly] </code> auto-fills the subject when composing.</li>
           <li><strong>Default audience tags</strong> — auto-selected on the Send wizard for this type.</li>
+          <li><strong>Allow public sign-ups</strong> — exposes this type on the public <code>/subscribe</code> flow and in Settings’ shareable signup links.</li>
+          <li><strong>Sender identity override</strong> — optional per-type From / Reply-To values. Leave blank to inherit from <Link to="/settings">Settings</Link>.</li>
           <li><strong>Newsletter template</strong> — the HTML body that pre-fills new newsletters of this type. Edit it visually or in raw HTML.</li>
         </ol>
         <p className="muted" style={{ fontSize: 13 }}>
           Archived types can no longer be selected on new newsletters but stay attached to past
-          sends so historical reports keep their grouping.
+          sends so historical reports keep their grouping. Only non-archived types with
+          <em> Allow public sign-ups</em> enabled show up on the public signup page.
         </p>
       </>
     ),
@@ -91,6 +96,11 @@ const SECTIONS: Section[] = [
           Switching from HTML → Visual may simplify hand-coded markup; the system warns you the
           first time and snapshots the original so you can hit <em>Restore HTML</em> if needed.
         </p>
+        <h4>Preview tools</h4>
+        <ul>
+          <li><strong>HTML preview pane</strong> — in HTML mode, a live side-by-side preview renders your markup as you type. Use <strong>Asset base URL</strong> if your HTML references relative assets.</li>
+          <li><strong>Preview rendered email</strong> — opens the full email in a modal, including the footer that will be appended on send.</li>
+        </ul>
         <h4>Images</h4>
         <p>
           Click <em>+ Image</em> to upload a new image or pick a previously uploaded one. Hosted
@@ -124,6 +134,12 @@ const SECTIONS: Section[] = [
           <li><strong>One at a time</strong> — click <em>+ Add subscriber</em>, fill email/name/org/tags.</li>
           <li><strong>Bulk import</strong> — CSV upload via the imports flow. Required column: <code>email</code>. Optional: <code>name</code>, <code>org</code>, <code>tags</code> (semicolon-separated).</li>
         </ul>
+        <h4>Finding and reviewing contacts</h4>
+        <ul>
+          <li>Use search, status filter, and tag filter together to narrow the table.</li>
+          <li>Large lists are paginated with <em>Prev</em> / <em>Next</em>.</li>
+          <li><strong>Import history</strong> is a third tab that records CSV imports and bulk delete operations, including downloadable source files and row-level failure details when available.</li>
+        </ul>
         <h4>Tags</h4>
         <p>
           Click a tag pill to remove it. Use the <em>+</em> popover on a row to add more. Tag
@@ -131,14 +147,17 @@ const SECTIONS: Section[] = [
         </p>
         <h4>Suppressions</h4>
         <p>
-          Toggle the view to <em>Suppressions</em> to see every email that can no longer receive
-          mail — auto-populated from bounces, complaints, and unsubscribe clicks. Suppressions
-          survive contact deletion (so re-importing a deleted contact won’t accidentally email
-          them).
+          Toggle the view to <em>Suppression list</em> to see every email that can no longer
+          receive mail. The panel has two scopes:
         </p>
+        <ul>
+          <li><strong>Global</strong> — hard bounces, complaints, and stop-everything opt-outs. Blocks every newsletter type.</li>
+          <li><strong>By newsletter type</strong> — unsubscribe events scoped to one type. Other types can still send.</li>
+        </ul>
         <p className="muted" style={{ fontSize: 13 }}>
-          Removing someone from suppressions is rare — typically only when a bounce was
-          transient or someone explicitly asks to be re-added.
+          Suppressions survive contact deletion, and <em>Delete all</em> removes only active
+          subscribers. Unsubscribed and bounced records are intentionally preserved so the system
+          does not re-mail them on a later import.
         </p>
       </>
     ),
@@ -159,13 +178,17 @@ const SECTIONS: Section[] = [
         <h4>Step 2 — Timing</h4>
         <ul>
           <li><strong>Send now</strong> — enqueues immediately.</li>
-          <li><strong>Schedule</strong> — pick date + time + timezone. EventBridge fires at the scheduled instant; you can cancel up until that point from <Link to="/history">History</Link>.</li>
+          <li><strong>Schedule</strong> — pick date + time + timezone. The scheduled time must be at least 1 minute in the future, and you can cancel up until that point from <Link to="/history">History</Link>.</li>
         </ul>
         <h4>Step 3 — Review & send</h4>
         <p>
           Click <em>Preview</em> in the top banner to see the full rendered email (with footer)
-          in a modal. Click <em>Send</em> to dispatch.
+          in a modal. You can either:
         </p>
+        <ul>
+          <li><strong>Simulate (dry-run)</strong> — materializes the audience exactly like a real send, but sends no email. The result appears under <Link to="/history">History</Link> → <em>Dry-runs</em>.</li>
+          <li><strong>Send</strong> or <strong>Schedule send</strong> — opens a confirmation modal that requires typing <code>send</code> before the real dispatch is allowed.</li>
+        </ul>
         <p className="muted" style={{ fontSize: 13 }}>
           The audience preview only counts active subscribers — suppressed and unsubscribed
           contacts are filtered out automatically.
@@ -180,23 +203,29 @@ const SECTIONS: Section[] = [
     body: () => (
       <>
         <p>
-          <Link to="/history">History</Link> lists every campaign with status, recipient count,
-          open rate, and click-through rate. Aggregate metric cards at the top sum across the
-          current filter (All / Sent / Scheduled / Drafts, optionally narrowed by type).
+          <Link to="/history">History</Link> lists campaigns with status, recipient count,
+          open rate, and click-through rate. Tabs separate <em>Drafts</em>, <em>Scheduled</em>,
+          <em>Sent</em>, <em>Dry-runs</em>, and <em>Archived</em>. Aggregate metric cards at the
+          top sum across the current filter and type selection.
+        </p>
+        <p>
+          The top metric cards are clickable — each opens a trend modal showing campaign-level
+          movement for that metric across sent campaigns.
         </p>
         <h4>Campaign detail</h4>
         <p>Click any row to drill in. The detail page shows:</p>
         <ul>
-          <li><strong>Four metric cards</strong> — recipients, opens, clicks, bounces.</li>
+          <li><strong>Four metric cards</strong> — delivered, opens, clicks, unsubscribes. Opens and clicks use unique-recipient counts when available, with total events shown secondarily.</li>
           <li><strong>Engagement over time</strong> — opens binned hourly (72h / 7d / All) with peak-hour and 50%-cumulative stats.</li>
-          <li><strong>Delivery funnel</strong> — sent → delivered → opened → clicked.</li>
-          <li><strong>Top links clicked</strong> — URLs grouped by recipient count and share.</li>
+          <li><strong>Top links clicked</strong> — URLs grouped by total clicks, unique clicks, and share.</li>
+          <li><strong>Audience tags</strong> — the include / exclude tags and matching mode used to target the campaign.</li>
         </ul>
         <h4>Header buttons</h4>
         <ul>
           <li><strong>View content</strong> — opens the original HTML in an iframe modal.</li>
           <li><strong>Duplicate</strong> — preselects this campaign’s template in the Send wizard.</li>
           <li><strong>Export report</strong> — downloads a per-recipient CSV with timestamps.</li>
+          <li><strong>Archive</strong> — hides a past send from the default views and removes its stats from top-level aggregates until restored from the Archived tab.</li>
         </ul>
       </>
     ),
@@ -208,9 +237,9 @@ const SECTIONS: Section[] = [
     body: () => (
       <>
         <p>
-          <Link to="/settings">Settings</Link> stores one footer used on every send. The
-          unsubscribe link and your mailing address are added automatically — you cannot omit
-          them, and you don’t need to include them in the footer body.
+          <Link to="/settings">Settings</Link> stores the org-wide sender identity, footer, and
+          public subscribe links. One Save button at the top applies to the sender-identity card
+          and the footer card together.
         </p>
         <h4>Required fields</h4>
         <ul>
@@ -218,10 +247,22 @@ const SECTIONS: Section[] = [
         </ul>
         <h4>Optional fields</h4>
         <ul>
+          <li><strong>From display name</strong> — inbox sender label. Defaults to <code>Ants Dispatch</code> if blank.</li>
+          <li><strong>From address local-part</strong> — the part before <code>@your-sending-domain</code>. The domain itself is fixed by SES verification.</li>
+          <li><strong>Reply-To</strong> — where replies go. Leave blank to route replies to the From address.</li>
           <li><strong>Sender name</strong> — bolded line above the address.</li>
           <li><strong>Footer body</strong> — brand text, social links, etc. Edited in the same WYSIWYG editor as Compose.</li>
         </ul>
-        <p>Click <em>Preview email</em> to see exactly how the footer renders.</p>
+        <h4>Public subscribe links</h4>
+        <p>
+          The bottom card surfaces the public <code>/subscribe</code> URL plus per-type links for
+          any newsletter types with <em>Allow public sign-ups</em> enabled. Use these links on
+          landing pages, bios, or forms when you want people to self-subscribe.
+        </p>
+        <p className="muted" style={{ fontSize: 13 }}>
+          Click <em>Preview email</em> to see exactly how the footer renders. Individual types can
+          override the org-wide From / Reply-To values on their edit page.
+        </p>
       </>
     ),
   },
@@ -234,14 +275,20 @@ const SECTIONS: Section[] = [
         <h4>Unsubscribe</h4>
         <p>
           Every email carries the visible unsubscribe link plus an <code>List-Unsubscribe</code>
-          header so Gmail/Apple Mail show their native one-click button. Suppressions are
-          permanent unless you explicitly remove them from <Link to="/subscribers">Subscribers
-          → Suppressions</Link>.
+          header so Gmail/Apple Mail show their native one-click button. Unsubscribes are scoped
+          to the campaign’s newsletter type unless the reader explicitly opts out of everything.
         </p>
         <h4>Bounces & complaints</h4>
         <p>
           Hard bounces and spam complaints auto-add the recipient to the suppression list. They
           will be skipped in any future send, even if re-imported.
+        </p>
+        <h4>Public sign-ups</h4>
+        <p>
+          The public subscribe flow uses double opt-in. Visitors submit the form, receive a
+          confirmation email, and only become active after clicking that link. Optional Turnstile
+          support can add an invisible anti-bot challenge on top of the built-in honeypot and
+          rate limiting.
         </p>
         <h4>Sandbox vs. production</h4>
         <p>
@@ -265,6 +312,12 @@ const SECTIONS: Section[] = [
           Open events take 1–2 minutes to flow through SES → SNS → events worker. Refresh after
           a couple of minutes. If still empty, you may have sent to a single recipient who hasn’t
           actually opened yet.
+        </p>
+        <h4>“I want to verify the audience before sending”</h4>
+        <p>
+          Use <em>Simulate (dry-run)</em> on the final Send step. It writes the exact recipient
+          rows a real send would use, appears under <Link to="/history">History</Link> →
+          <em> Dry-runs</em>, and never sends email.
         </p>
         <h4>“Send was queued but not delivered”</h4>
         <p>
