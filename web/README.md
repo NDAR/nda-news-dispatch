@@ -1,6 +1,6 @@
 # @ants-dispatch/web — admin SPA
 
-Vite + React 18 + TypeScript + TanStack Router/Query + TipTap WYSIWYG, with
+Vite + React 18 + TypeScript + TanStack Router/Query + Jodit WYSIWYG, with
 hand-rolled Cognito Hosted UI PKCE auth. Served from the S3 `spa` bucket via
 CloudFront in prod; `npm run dev` for local development.
 
@@ -43,17 +43,24 @@ invalidation. From the project root:
 
 The `web/deploy.sh` helper does the same thing if you cd into `web/` first.
 
-For the manual flow:
+For the manual flow, mirror what `web/deploy.sh` does: resolve stack outputs,
+export the required Vite variables, then build.
 
 ```bash
-# Build a static bundle — inline the prod env:
-cat > .env.production <<EOF
+AUTH=AntsDispatch-Dev-Auth
+EDGE=AntsDispatch-Dev-Edge
+REGION=us-east-1
+
+PUBLIC_URL=$(aws cloudformation describe-stacks --stack-name "$EDGE" --region "$REGION" \
+  --query 'Stacks[0].Outputs[?OutputKey==`PublicUrl`].OutputValue' --output text)
 VITE_API_BASE=
-VITE_COGNITO_DOMAIN=<HostedUiDomain>
-VITE_COGNITO_CLIENT_ID=<UserPoolClientId>
-VITE_REDIRECT_URI=https://<your-domain>/auth/callback
-# VITE_APP_BRAND=Ants   # optional; overrides the default sidebar/title prefix
-EOF
+VITE_COGNITO_DOMAIN=$(aws cloudformation describe-stacks --stack-name "$AUTH" --region "$REGION" \
+  --query 'Stacks[0].Outputs[?OutputKey==`HostedUiDomain`].OutputValue' --output text)
+VITE_COGNITO_CLIENT_ID=$(aws cloudformation describe-stacks --stack-name "$AUTH" --region "$REGION" \
+  --query 'Stacks[0].Outputs[?OutputKey==`UserPoolClientId`].OutputValue' --output text)
+VITE_REDIRECT_URI="${PUBLIC_URL%/}/auth/callback"
+export VITE_API_BASE VITE_COGNITO_DOMAIN VITE_COGNITO_CLIENT_ID VITE_REDIRECT_URI
+
 npm run build
 
 # Publish to the SPA bucket + invalidate CloudFront:
@@ -64,7 +71,7 @@ DIST=$(aws cloudformation describe-stacks --stack-name AntsDispatch-Dev-Edge --r
 aws s3 sync dist/ "s3://$SPA/" --delete \
   --cache-control 'public, max-age=31536000, immutable' --exclude index.html
 aws s3 cp dist/index.html "s3://$SPA/index.html" --cache-control 'no-cache, must-revalidate'
-aws cloudfront create-invalidation --distribution-id "$DIST" --paths '/index.html' '/'
+aws cloudfront create-invalidation --distribution-id "$DIST" --paths '/*'
 ```
 
 `VITE_API_BASE=""` in prod makes the SPA use same-origin CloudFront routing
@@ -89,13 +96,13 @@ The unauthenticated `/auth/callback` runs the PKCE code exchange.
 
 | Route                        | Backed by | Purpose |
 |------------------------------|-----------|---------|
-| `/compose`                   | `/admin/templates` (CRUD), `/admin/types`, `/admin/assets`, `/admin/templates/{id}/test-send` | Per-newsletter editor with TipTap (Visual / HTML modes), live preview iframe, asset picker, debounced autosave, "Send to yourself" test send, "Preview rendered email" modal, resizable HTML/preview split. |
+| `/compose`                   | `/admin/templates` (CRUD), `/admin/types`, `/admin/assets`, `/admin/templates/{id}/test-send` | Per-newsletter editor with Jodit (Visual / HTML modes), live preview iframe, asset picker, debounced autosave, "Send to yourself" test send, "Preview rendered email" modal, resizable HTML/preview split. |
 | `/types`, `/types/$typeId`   | `/admin/types` | List + edit page for newsletter types, including a default HTML body that seeds new newsletters of that type. |
 | `/subscribers`               | `/admin/contacts`, `/admin/imports`, `/admin/suppressions` | Subscriber table, CSV import, single-contact create, suppressions panel. |
 | `/send`                      | `/admin/audience/preview`, `/admin/campaigns`, `POST /admin/campaigns/{id}/send` | Three-step send wizard (recipients, timing, review). Hands off to `worker-enqueue` via the campaign send API. |
 | `/history`                   | `/admin/campaigns?status=…` | Sortable list of campaigns with delivery / open-rate / CTR / unsubscribe stats; clickable metric cards open a per-metric trend modal. |
 | `/history/$campaignId`       | `/admin/campaigns/{id}`, `/admin/campaigns/{id}/recipients`, `/admin/campaigns/{id}/links` | Detail page: aggregate metrics, engagement-over-time chart, per-recipient table with bounce / opened / clicked filters, top-links card with Total / Unique / % of total columns. |
-| `/settings`                  | `/admin/settings` | Org-level email footer (TipTap), sender name + address, live preview iframe. Footer + sender info are auto-appended on every send. |
+| `/settings`                  | `/admin/settings` | Org-level email footer (Jodit), sender name + address, live preview iframe. Footer + sender info are auto-appended on every send. |
 | `/help`                      | — | Static walkthrough of every page; sticky TOC sidebar. |
 | `/auth/callback`             | Cognito Hosted UI | PKCE code exchange. |
 

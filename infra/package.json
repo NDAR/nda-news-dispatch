@@ -15,14 +15,14 @@
     "deploy:prod": "npx cdk deploy --all -c env=prod --require-approval broadening"
   },
   "dependencies": {
-    "aws-cdk-lib": "^2.170.0",
-    "constructs": "^10.3.0",
+    "aws-cdk-lib": "^2.254.0",
+    "constructs": "^10.5.0",
     "source-map-support": "^0.5.21"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.143",
     "@types/node": "^20.14.0",
-    "aws-cdk": "^2.170.0",
+    "aws-cdk": "^2.1125.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.5.0"
   }

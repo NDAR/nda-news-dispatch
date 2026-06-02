@@ -535,77 +535,52 @@ h3 { font-size: 18px; line-height: 1.25; }
 }
 
 /* WYSIWYG toolbar */
-.wysiwyg-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 2px;
-  padding: 6px 10px;
-  background: var(--paper-deep);
-  border-bottom: 1px solid var(--rule-soft);
-  flex-shrink: 0;
-}
-.wysiwyg-toolbar .tb-btn {
-  min-width: 26px;
-  height: 26px;
-  padding: 0 6px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--ink-soft);
-  font-family: var(--sans);
-  font-size: 12px;
-  font-weight: 500;
-  border-radius: 3px;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.wysiwyg-toolbar .tb-btn:hover { background: var(--paper); color: var(--ink); border-color: var(--rule-soft); }
-.wysiwyg-toolbar .tb-btn.active {
-  background: var(--ink);
-  color: var(--paper);
-  border-color: var(--ink);
-}
-.wysiwyg-toolbar .tb-divider {
-  width: 1px;
-  height: 18px;
-  background: var(--rule-soft);
-  margin: 0 4px;
-}
-
-/* WYSIWYG editor surface (TipTap) */
+/* WYSIWYG editor surface (Jodit) */
 .wysiwyg-editor {
   height: 100%;
   overflow: auto;
   background: var(--paper);
 }
-.wysiwyg-editor .tiptap {
-  min-height: 100%;
-  padding: 18px 24px;
+.jodit-editor-wrap {
+  border: 1px solid var(--rule, #e5e7eb);
+  border-radius: 6px;
+}
+.jodit-editor-wrap .jodit-container {
+  border: none;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  min-height: inherit;
+}
+.jodit-editor-wrap .jodit-workplace {
+  min-height: inherit;
+}
+.jodit-editor-wrap .jodit-wysiwyg {
+  min-height: inherit;
+  padding: 18px 24px !important;
   font-family: var(--serif);
   font-size: 15px;
   line-height: 1.6;
   color: var(--ink);
   outline: none;
 }
-.wysiwyg-editor .tiptap:focus { outline: none; }
-.wysiwyg-editor .tiptap > * + * { margin-top: 0.75em; }
-.wysiwyg-editor .tiptap h1 { font-family: var(--serif); font-size: 26px; line-height: 1.2; font-weight: 600; }
-.wysiwyg-editor .tiptap h2 { font-family: var(--serif); font-size: 21px; line-height: 1.25; font-weight: 600; }
-.wysiwyg-editor .tiptap h3 { font-family: var(--serif); font-size: 17px; line-height: 1.3; font-weight: 600; }
-.wysiwyg-editor .tiptap p { margin: 0; }
-.wysiwyg-editor .tiptap ul, .wysiwyg-editor .tiptap ol { padding-left: 1.4em; }
-.wysiwyg-editor .tiptap li { margin: 0.2em 0; }
-.wysiwyg-editor .tiptap blockquote {
+.jodit-editor-wrap .jodit-wysiwyg:focus { outline: none; }
+.jodit-editor-wrap .jodit-wysiwyg > * + * { margin-top: 0.75em; }
+.jodit-editor-wrap .jodit-wysiwyg h1 { font-family: var(--serif); font-size: 26px; line-height: 1.2; font-weight: 600; }
+.jodit-editor-wrap .jodit-wysiwyg h2 { font-family: var(--serif); font-size: 21px; line-height: 1.25; font-weight: 600; }
+.jodit-editor-wrap .jodit-wysiwyg h3 { font-family: var(--serif); font-size: 17px; line-height: 1.3; font-weight: 600; }
+.jodit-editor-wrap .jodit-wysiwyg p { margin: 0; }
+.jodit-editor-wrap .jodit-wysiwyg ul, .jodit-editor-wrap .jodit-wysiwyg ol { padding-left: 1.4em; }
+.jodit-editor-wrap .jodit-wysiwyg li { margin: 0.2em 0; }
+.jodit-editor-wrap .jodit-wysiwyg blockquote {
   border-left: 3px solid var(--accent);
   padding-left: 14px;
   color: var(--ink-soft);
   font-style: italic;
 }
-.wysiwyg-editor .tiptap a { color: var(--accent-deep); text-decoration: underline; }
-.wysiwyg-editor .tiptap img { max-width: 100%; height: auto; }
-.wysiwyg-editor .tiptap pre {
+.jodit-editor-wrap .jodit-wysiwyg a { color: var(--accent-deep); text-decoration: underline; }
+.jodit-editor-wrap .jodit-wysiwyg img { max-width: 100%; height: auto; }
+.jodit-editor-wrap .jodit-wysiwyg pre {
   background: var(--paper-deep);
   padding: 10px 14px;
   border-radius: 4px;
@@ -613,7 +588,14 @@ h3 { font-size: 18px; line-height: 1.25; }
   font-size: 12.5px;
   overflow-x: auto;
 }
-.wysiwyg-editor .tiptap hr { border: none; border-top: 1px solid var(--rule); margin: 1.2em 0; }
+.jodit-editor-wrap .jodit-wysiwyg hr { border: none; border-top: 1px solid var(--rule); margin: 1.2em 0; }
+.jodit-editor-wrap .jodit-toolbar__box {
+  background: var(--paper-deep);
+  border-color: var(--rule-soft);
+}
+.jodit-editor-wrap .jodit-ui-button {
+  color: var(--ink-soft);
+}
 
 /* Modal */
 .modal-backdrop {

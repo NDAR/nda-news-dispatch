@@ -1,7 +1,8 @@
 # Ants Dispatch
 A serverless newsletter sender for small admin teams. Compose HTML or
-WYSIWYG, segment subscribers by tag, send (or schedule) campaigns through
-SES, track delivery / opens / clicks / bounces, and self-serve unsubscribes.
+WYSIWYG, segment subscribers by tag, send / simulate / schedule campaigns
+through SES, track delivery / opens / clicks / bounces, and self-serve
+unsubscribes.
 
 <img width="1183" height="654" alt="Screenshot 2026-04-26 at 8 59 53 PM" src="https://github.com/user-attachments/assets/3f1e850d-6144-42c8-8009-895625a40a39" />
 <br>
@@ -14,11 +15,11 @@ The default brand prefix is **Ants** (configurable per build via
 
 | Layer            | Choice                                                              |
 |------------------|---------------------------------------------------------------------|
-| **Frontend**     | Vite, React 18, TypeScript, TanStack Router, TanStack Query, TinyMCE 7 |
+| **Frontend**     | Vite, React 18, TypeScript, TanStack Router, TanStack Query, Jodit Editor |
 | **Auth**         | AWS Cognito (Hosted UI, OAuth 2.0 PKCE)                             |
 | **API**          | API Gateway (Regional REST) → Node.js 20 Lambdas, AWS WAF v2        |
-| **Data**         | DynamoDB single-table design with GSI1, streams, PITR, TTL          |
-| **Async work**   | SQS (`import`, `send`) + dead-letter queues                         |
+| **Data**         | DynamoDB single-table design with GSI1, GSI2, streams, PITR, TTL    |
+| **Async work**   | SQS (`import`, `enqueue`, `send`) + dead-letter queues              |
 | **Email**        | SES v2 (DKIM, custom MAIL-FROM, configuration set + event tracking) |
 | **Event ingest** | SES → SNS → Lambda                                                  |
 | **Scheduling**   | EventBridge Scheduler (one-time at-time triggers)                   |
@@ -39,18 +40,24 @@ The default brand prefix is **Ants** (configurable per build via
                       ┌──────────────────────────┐
                       │  API Gateway + Lambdas    │
                       │  templates · contacts ·   │
-                      │  imports · campaigns ·    │  ─ DDB (single table, GSI1)
+                      │  imports · campaigns ·    │  ─ DDB (single table, GSI1 + GSI2)
                       │  audience · assets ·      │  ─ S3 (archive, imports)
-                      │  suppressions · u (pub)   │  ─ SES v2 (send)
-                      └──────┬─────┬─────┬───────┘  ─ SQS (send, import)
-                             │     │     │          ─ EventBridge Scheduler
+                      │  suppressions · public    │  ─ SES v2 (send)
+                      └──────┬─────┬─────┬───────┘  ─ SQS (import, enqueue, send)
+                             │     │     │
                              ▼     ▼     ▼
-            ┌────────────────┐ ┌──────────────┐ ┌──────────────────┐
-            │ worker-import  │ │ worker-send  │ │ worker-dispatch  │
-            │  (SQS → DDB)   │ │ (SQS → SES)  │ │ (Scheduler → SQS)│
-            └────────────────┘ └──────────────┘ └──────────────────┘
+            ┌────────────────┐ ┌────────────────┐ ┌──────────────────┐
+            │ worker-import  │ │ worker-enqueue │ │ worker-dispatch  │
+            │  (SQS → DDB)   │ │ (SQS → RCPT/SQS)│ │ (Scheduler → SQS)│
+            └────────────────┘ └──────┬─────────┘ └──────────────────┘
                                        │
                                        ▼
+                                  ┌──────────────┐
+                                  │ worker-send  │
+                                  │  (SQS → SES) │
+                                  └──────┬───────┘
+                                         │
+                                         ▼
                                   ┌─────────┐     SES events
                                   │  SES v2 │ ──▶ SNS ──▶ worker-events ──▶ DDB stats
                                   └─────────┘
@@ -62,11 +69,11 @@ The default brand prefix is **Ants** (configurable per build via
 |------------------|----------------------------------------------------------------------------------|
 | **Auth**         | Cognito User Pool + Hosted UI domain + SPA app client                            |
 | **Storage**      | S3 buckets: `spa` (assets), `archive` (rendered HTML + uploaded images)          |
-| **Data**         | DynamoDB single table, SQS `send` queue + DLQ                                    |
+| **Data**         | DynamoDB single table, SQS `send` queue + DLQ, SQS `enqueue` queue + DLQ         |
 | **Processing**   | S3 `imports` bucket + SQS `import` queue + `worker-import` Lambda                |
-| **Delivery**     | SES domain identity + DKIM + custom MAIL-FROM + ConfigurationSet + `worker-send` |
+| **Delivery**     | SES domain identity + DKIM + custom MAIL-FROM + ConfigurationSet + `worker-send` + `worker-enqueue` |
 | **Events**       | SNS `ses-events` topic + `worker-events` Lambda (open/click/bounce/etc.)         |
-| **Api**          | API Gateway + WAF + 8 Lambdas + EventBridge Scheduler + `worker-dispatch`        |
+| **Api**          | API Gateway + WAF + admin/public Lambdas + EventBridge Scheduler + `worker-dispatch` |
 | **Edge**         | CloudFront distribution + ACM cert (single origin fronts SPA + buckets + API)    |
 
 ### Scalability
@@ -136,7 +143,7 @@ every link in inbound mail before delivery. Untreated, those crawls
 inflate Open / Click stats and — worst of all — fire RFC 8058 one-click
 unsubscribes that opt real subscribers out without their action.
 
-Three defenses, applied unconditionally:
+Four defenses, applied unconditionally:
 
 1. **No `List-Unsubscribe-Post: One-Click` header.** Native client
    "Unsubscribe" buttons still surface via the bare `List-Unsubscribe`
@@ -148,20 +155,28 @@ Three defenses, applied unconditionally:
    (the form submission from the confirmation page) writes the SUPP
    row.
 3. **Scanner detection in `worker-events`.** Open and Click events
-   that arrive within 30 s of the recipient's `deliveredAt`/`queuedAt`
-   are dropped (real users don't open mail in <30 s). Click events
    whose SES `userAgent` matches a known scanner regex (Defender,
    Proofpoint, Mimecast, Barracuda, Cisco Talos, Sophos, Bitdefender,
    Zscaler, headless browsers, `wget`/`curl`/`python-requests`, …) are
-   also dropped. Both filters fail open if the RCPT row is missing so
-   legitimate engagement is never silently lost.
+   dropped. Separately, a very short **5-second** post-delivery window
+   is applied only to events with **no user-agent at all**, which trims
+   security-gateway prefetches without discarding genuine fast-opens.
+   Both filters fail open if the RCPT row is missing so legitimate
+   engagement is never silently lost.
+4. **`ses:no-track` on non-engagement links.** The footer unsubscribe
+   link and the view-in-browser link are marked with SES's no-track
+   attribute so scanner prefetches on those links do not inflate campaign
+   click metrics.
 
 ### Public subscribe page
 
 A linkable, unauthenticated sign-up form lives at
 `https://<your-domain>/subscribe` (or `/subscribe?type=<typeId>` to
 preselect a newsletter). The Settings page in the SPA lists the
-copy-paste URLs for the generic form and each active type. Submissions
+copy-paste URLs for the generic form and each newsletter type with
+`publicSubscribable = true`. When exactly one type is publicly
+subscribable, the generic form auto-selects it; when none are, the page
+shows a friendly "sign-ups are currently closed" message. Submissions
 are double opt-in: the form writes a `PENDING_OPTIN#<email>` row with a
 48 h DDB TTL and emails an HMAC-signed confirmation link; only on click
 does the contact land on the active list.
@@ -190,8 +205,9 @@ Bot resistance, layered:
 infra/                CDK app (8 stacks above)
 services/
   api-admin/          Lambdas behind /admin/* (templates, contacts, …)
-  api-public/         Lambdas behind /public/* (unsubscribe)
+  api-public/         Lambdas behind /public/* (unsubscribe, subscribe, view)
   worker-import/      SQS-triggered CSV → contacts upsert
+  worker-enqueue/     SQS-triggered campaign audience materialization
   worker-send/        SQS-triggered SES SendEmail
   worker-events/      SNS-triggered SES event ingest → DDB stats
   worker-dispatch/    EventBridge Scheduler-triggered scheduled-send
@@ -360,11 +376,12 @@ aws cognito-idp admin-set-user-password \
   --password 'YourTempPassword123!' --permanent
 ```
 
-The user pool requires TOTP MFA. On first sign-in via the Hosted UI,
-the admin will be prompted to scan a QR code with an authenticator app
-(Authy, Google Authenticator, 1Password, Bitwarden, etc.) and enter a
-6-digit code to complete enrollment. Subsequent logins prompt for the
-code after the password.
+In `prod`, the user pool requires TOTP MFA. On first sign-in via the
+Hosted UI, the admin will be prompted to scan a QR code with an
+authenticator app (Authy, Google Authenticator, 1Password, Bitwarden,
+etc.) and enter a 6-digit code to complete enrollment. Subsequent
+logins prompt for the code after the password. In `dev`, MFA is off so
+local iteration against the deployed stack is less cumbersome.
 
 If an admin loses their authenticator, an operator with AWS access can
 reset their MFA enrollment so they can re-enroll on next login:
@@ -378,30 +395,21 @@ aws cognito-idp admin-set-user-mfa-preference \
 
 ### 8. Build + deploy the SPA
 
-The SPA reads its config at build time from `web/.env.production`:
-
-```bash
-cd web
-cp .env.example .env.production
-
-# Fill in from CloudFormation outputs:
-aws cloudformation describe-stacks --stack-name AntsDispatch-Dev-Auth --region us-east-1 \
-  --query 'Stacks[0].Outputs' --output table
-```
-
-Set:
-- `VITE_API_BASE=` (empty — same-origin via CloudFront)
-- `VITE_COGNITO_DOMAIN=<HostedUiDomain>`
-- `VITE_COGNITO_CLIENT_ID=<UserPoolClientId>`
-- `VITE_REDIRECT_URI=https://dispatch.your-domain.com/auth/callback`
-- `VITE_APP_BRAND=Ants` *(optional; default is "Ants")*
-
-Then build + push:
+The SPA config is embedded at build time. Use the deploy helper so it resolves
+the required Cognito and CloudFront outputs before building:
 
 ```bash
 cd web
 ./deploy.sh dev   # builds, syncs to S3, invalidates CloudFront
 ```
+
+The script sets:
+- `VITE_API_BASE=` (empty — same-origin via CloudFront)
+- `VITE_COGNITO_DOMAIN=<HostedUiDomain>`
+- `VITE_COGNITO_CLIENT_ID=<UserPoolClientId>`
+- `VITE_REDIRECT_URI=<PublicUrl>/auth/callback`
+
+`VITE_APP_BRAND` remains optional; if unset, the UI uses "Ants".
 
 Visit `https://dispatch.your-domain.com`, sign in with the admin user.
 
@@ -440,7 +448,7 @@ cd web && ./deploy.sh dev
 
 ### `dev` vs `prod`
 
-The env flag drives five things:
+The env flag drives six things:
 
 1. **Stack name prefix.** `AntsDispatch-Dev-*` vs `AntsDispatch-Prod-*` — each
    env has its own CloudFormation stacks, S3 SPA bucket, CloudFront
@@ -459,6 +467,8 @@ The env flag drives five things:
    (`SpaBucketName`, `DistributionId`, `PublicUrl`) by the env-specific stack
    prefix; pointing it at the wrong env will either fail to resolve outputs
    or push the SPA into the wrong bucket.
+6. **MFA policy.** `prod` requires TOTP MFA for admin sign-in; `dev`
+   disables MFA entirely.
 
 > ⚠️ The root `deploy.sh` currently passes `--require-approval never` for
 > both envs, which silences the prod approval prompt that
@@ -504,39 +514,14 @@ identity, and Cognito's allowed callback URL.
 
 Copyright © 2026 ScientHouse LLC
 
-This project is **dual-licensed by component**:
+This repository is released under the **MIT License**. See
+[`LICENSE`](./LICENSE).
 
-- **Backend, infrastructure, shared packages, and tooling** (`infra/`,
-  `services/`, `packages/`, `scripts/`, root `deploy.sh`, root `package.json`)
-  — released under the **MIT License**. See [`LICENSE`](./LICENSE).
-- **Compiled web SPA bundle** (the output of `npm run build` in `web/` —
-  i.e. `web/dist/`) — distributed under the **GNU General Public License,
-  version 2 or later (GPL-2.0-or-later)**, because that bundle statically
-  links TinyMCE 7, which is GPL-2.0-or-later. See
-  [`LICENSE.gpl-2.0`](./LICENSE.gpl-2.0).
+Notable third-party dependencies are permissively licensed as well
+(React, TanStack Router/Query, Jodit, AWS SDK v3, AWS CDK v2, Vite,
+TypeScript, etc.). If you need a dependency-level attribution report,
+generate one from the repo root with:
 
-The individual source files under `web/src/` remain **MIT** in this
-repository (anyone may take a file and reuse it under MIT). Only the
-combined production bundle picks up the GPL-2 obligation, because that's
-where TinyMCE's compiled code lives alongside ours.
-
-If you redistribute the compiled SPA — for example by hosting it for
-end users or shipping it inside another product — GPL-2 requires that
-you either bundle the corresponding source code with it or offer a
-written promise to provide the source on request. The source is this
-repository.
-
-### Third-party notices
-
-See [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) for the per-package
-attribution list. The licensing-significant dependencies are:
-
-- **TinyMCE 7** — GPL-2.0-or-later (Tiny Technologies, Inc.). Bundled into
-  the production SPA at build time.
-- React, TanStack Router/Query, AWS SDK v3, AWS CDK v2, Zod, Vite, etc.
-  — MIT or Apache-2.0.
-- Source Serif 4, Inter, JetBrains Mono via Google Fonts — SIL Open Font
-  License 1.1.
-
-Regenerate the full attribution list with
-`npx license-checker --production --summary` from the repo root.
+```bash
+npx license-checker --production --summary
+```

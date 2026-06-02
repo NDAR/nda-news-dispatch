@@ -2,6 +2,7 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { RouterProvider, createRouter } from '@tanstack/react-router';
+import 'jodit/es2021/jodit.min.css';
 import { routeTree } from './routeTree.gen';
 import { config } from './config';
 

@@ -1,9 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useRef, useState } from 'react';
-import { useEditor, EditorContent, type Editor } from '@tiptap/react';
-import StarterKit from '@tiptap/starter-kit';
-import Link from '@tiptap/extension-link';
+import { RichHtmlEditor, normalizeEmptyRichHtml } from '../components/RichHtmlEditor';
 import { getSettings, listTypes, updateSettings, type OrgSettings } from '../api/endpoints';
 import { renderFooterPreviewHtml } from '../lib/footerPreview';
 import { buildPreviewSrcDoc } from '../lib/previewFrame';
@@ -31,15 +29,9 @@ function SettingsPage() {
 
   const sendingDomain = data?.sendingDomain ?? '';
 
-  const editor = useEditor({
-    extensions: [StarterKit, Link.configure({ openOnClick: false, autolink: true })],
-    content: '',
-    onUpdate: ({ editor }) => setFooterHtml(editor.getHTML()),
-  });
-
   // One-shot seed once data loads. Subsequent renders preserve user edits.
   useEffect(() => {
-    if (seededRef.current || !data || !editor) return;
+    if (seededRef.current || !data) return;
     seededRef.current = true;
     setFooterHtml(data.footerHtml ?? '');
     setSenderName(data.senderName ?? '');
@@ -47,8 +39,7 @@ function SettingsPage() {
     setFromName(data.fromName ?? '');
     setFromLocalPart(data.fromLocalPart ?? '');
     setReplyTo(data.replyTo ?? '');
-    editor.commands.setContent(data.footerHtml || '<p></p>', { emitUpdate: false });
-  }, [data, editor]);
+  }, [data]);
 
   const saveMut = useMutation({
     mutationFn: (input: Partial<OrgSettings>) => updateSettings(input),
@@ -64,8 +55,9 @@ function SettingsPage() {
 
   function onSave() {
     setSaveError(null);
+    const normalizedFooterHtml = normalizeEmptyRichHtml(footerHtml);
     saveMut.mutate({
-      footerHtml: footerHtml === '<p></p>' ? '' : footerHtml,
+      footerHtml: normalizedFooterHtml,
       senderName: senderName.trim() || undefined,
       senderAddress: senderAddress.trim() || undefined,
       fromName: fromName.trim() || undefined,
@@ -76,7 +68,7 @@ function SettingsPage() {
 
   const dirty =
     !!data &&
-    ((data.footerHtml ?? '') !== (footerHtml === '<p></p>' ? '' : footerHtml) ||
+    ((data.footerHtml ?? '') !== normalizeEmptyRichHtml(footerHtml) ||
       (data.senderName ?? '') !== senderName ||
       (data.senderAddress ?? '') !== senderAddress ||
       (data.fromName ?? '') !== fromName ||
@@ -182,18 +174,11 @@ function SettingsPage() {
 
           <div className="stack" style={{ gap: 6 }}>
             <label className="eyebrow">Footer body (optional)</label>
-            <FooterToolbar editor={editor} />
-            <div
-              className="wysiwyg-editor"
-              style={{
-                minHeight: 160,
-                height: 'auto',
-                border: '1px solid var(--rule, #e5e7eb)',
-                borderRadius: 6,
-              }}
-            >
-              <EditorContent editor={editor} />
-            </div>
+            <RichHtmlEditor
+              value={footerHtml}
+              onChange={setFooterHtml}
+              minHeight={180}
+            />
             <p className="muted" style={{ fontSize: 12 }}>
               Brand text, social links, etc. Leave empty if you only need the address +
               unsubscribe.
@@ -211,7 +196,7 @@ function SettingsPage() {
 
           {showPreview && (
             <PreviewPanel
-              footerHtml={footerHtml === '<p></p>' ? '' : footerHtml}
+              footerHtml={normalizeEmptyRichHtml(footerHtml)}
               senderName={senderName}
               senderAddress={senderAddress}
             />
@@ -463,48 +448,6 @@ function UrlRow({ label, url }: { label: string; url: string }) {
         </a>
       </div>
     </div>
-  );
-}
-
-function FooterToolbar({ editor }: { editor: Editor | null }) {
-  if (!editor) return null;
-  return (
-    <div className="row items-center gap-sm" style={{ flexWrap: 'wrap' }}>
-      <ToolbarButton onClick={() => editor.chain().focus().toggleBold().run()} active={editor.isActive('bold')}>B</ToolbarButton>
-      <ToolbarButton onClick={() => editor.chain().focus().toggleItalic().run()} active={editor.isActive('italic')}><i>I</i></ToolbarButton>
-      <ToolbarButton onClick={() => {
-        const prev = editor.getAttributes('link').href as string | undefined;
-        const url = window.prompt('URL', prev ?? 'https://');
-        if (url === null) return;
-        if (url === '') {
-          editor.chain().focus().extendMarkRange('link').unsetLink().run();
-        } else {
-          editor.chain().focus().extendMarkRange('link').setLink({ href: url }).run();
-        }
-      }} active={editor.isActive('link')}>Link</ToolbarButton>
-      <ToolbarButton onClick={() => editor.chain().focus().toggleBulletList().run()} active={editor.isActive('bulletList')}>• List</ToolbarButton>
-    </div>
-  );
-}
-
-function ToolbarButton({
-  children,
-  onClick,
-  active,
-}: {
-  children: React.ReactNode;
-  onClick: () => void;
-  active?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`btn btn-sm ${active ? 'btn-primary' : 'btn-ghost'}`}
-      style={{ minWidth: 32 }}
-    >
-      {children}
-    </button>
   );
 }
 

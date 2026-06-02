@@ -70,9 +70,11 @@ export class AuthStack extends Stack {
       },
     });
 
+    const accountSuffix = config.account ? config.account.slice(-4) : 'local';
+
     this.userPoolDomain = this.userPool.addDomain('HostedUi', {
       cognitoDomain: {
-        domainPrefix: `ants-dispatch-${config.envName}-${this.account.slice(-4)}`,
+        domainPrefix: `ants-dispatch-${config.envName}-${accountSuffix}`,
       },
     });
 

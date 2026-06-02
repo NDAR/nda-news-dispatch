@@ -33,6 +33,12 @@ DIST_ID=$(aws cloudformation describe-stacks \
 PUBLIC_URL=$(aws cloudformation describe-stacks \
   --stack-name "${STACK_PREFIX}-Edge" --region "$REGION" \
   --query 'Stacks[0].Outputs[?OutputKey==`PublicUrl`].OutputValue' --output text)
+COGNITO_DOMAIN=$(aws cloudformation describe-stacks \
+  --stack-name "${STACK_PREFIX}-Auth" --region "$REGION" \
+  --query 'Stacks[0].Outputs[?OutputKey==`HostedUiDomain`].OutputValue' --output text)
+COGNITO_CLIENT_ID=$(aws cloudformation describe-stacks \
+  --stack-name "${STACK_PREFIX}-Auth" --region "$REGION" \
+  --query 'Stacks[0].Outputs[?OutputKey==`UserPoolClientId`].OutputValue' --output text)
 
 if [[ -z "$SPA_BUCKET" || "$SPA_BUCKET" == "None" ]]; then
   echo "Could not resolve SPA bucket from ${STACK_PREFIX}-Storage." >&2
@@ -40,6 +46,18 @@ if [[ -z "$SPA_BUCKET" || "$SPA_BUCKET" == "None" ]]; then
 fi
 if [[ -z "$DIST_ID" || "$DIST_ID" == "None" ]]; then
   echo "Could not resolve CloudFront distribution from ${STACK_PREFIX}-Edge." >&2
+  exit 1
+fi
+if [[ -z "$PUBLIC_URL" || "$PUBLIC_URL" == "None" ]]; then
+  echo "Could not resolve public URL from ${STACK_PREFIX}-Edge." >&2
+  exit 1
+fi
+if [[ -z "$COGNITO_DOMAIN" || "$COGNITO_DOMAIN" == "None" ]]; then
+  echo "Could not resolve Cognito Hosted UI domain from ${STACK_PREFIX}-Auth." >&2
+  exit 1
+fi
+if [[ -z "$COGNITO_CLIENT_ID" || "$COGNITO_CLIENT_ID" == "None" ]]; then
+  echo "Could not resolve Cognito client id from ${STACK_PREFIX}-Auth." >&2
   exit 1
 fi
 
@@ -50,7 +68,12 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   say "Installing (if needed)…"
   [[ -d node_modules ]] || npm install
   say "Building…"
-  npm run build
+  VITE_API_BASE="" \
+    VITE_COGNITO_DOMAIN="$COGNITO_DOMAIN" \
+    VITE_COGNITO_CLIENT_ID="$COGNITO_CLIENT_ID" \
+    VITE_COGNITO_REGION="$REGION" \
+    VITE_REDIRECT_URI="${PUBLIC_URL%/}/auth/callback" \
+    npm run build
 else
   say "Skipping build (using existing dist/)."
 fi
@@ -70,7 +93,7 @@ aws s3 cp dist/index.html "s3://$SPA_BUCKET/index.html" \
 
 say "Creating CloudFront invalidation…"
 INVAL_ID=$(aws cloudfront create-invalidation \
-  --distribution-id "$DIST_ID" --paths '/index.html' '/' \
+  --distribution-id "$DIST_ID" --paths '/*' \
   --query 'Invalidation.Id' --output text)
 say "Invalidation $INVAL_ID created (typically completes in <60s)."
 

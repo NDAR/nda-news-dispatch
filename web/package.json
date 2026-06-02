@@ -14,11 +14,8 @@
   "dependencies": {
     "@tanstack/react-query": "^5.62.0",
     "@tanstack/react-router": "^1.87.0",
-    "@tiptap/extension-image": "^3.22.4",
-    "@tiptap/extension-link": "^3.22.4",
-    "@tiptap/extension-text-align": "^3.22.4",
-    "@tiptap/react": "^3.22.4",
-    "@tiptap/starter-kit": "^3.22.4",
+    "jodit": "^4.9.0",
+    "jodit-react": "^5.2.19",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
